@@ -1,6 +1,6 @@
 # voice-assistant
 
-macOS / Linux 上的本地语音助手：说出唤醒词，语音指令自动转文字并交给
+macOS / Windows / Linux 上的本地语音助手：说出唤醒词，语音指令自动转文字并交给
 [kiro-cli](https://kiro.dev) 执行。纯 Rust 单二进制，推理全部本地运行，无云端依赖。
 
 ```
@@ -42,9 +42,14 @@ supervisor 保证任何时刻**有且只有一个** agent 存活——崩溃/卡
 ## 依赖
 
 - Rust 工具链（1.80+）
-- cmake（编译 whisper.cpp 用）：`brew install cmake` / `apt install cmake`
+- cmake（编译 whisper.cpp 用）：`brew install cmake` / `apt install cmake` /
+  Windows 用 [Build Tools for Visual Studio](https://visualstudio.microsoft.com/downloads/)（含 MSVC + cmake）
+- Linux 额外需要 ALSA 头文件：`apt install libasound2-dev`
 - [kiro-cli](https://kiro.dev) 已安装并登录
 - macOS：首次运行需给终端授予麦克风权限（系统设置 → 隐私与安全性 → 麦克风）
+
+三平台的构建与单元测试由 GitHub Actions 矩阵持续验证（`.github/workflows/ci.yml`）；
+作者的日常开发机是 macOS，Windows / Linux 的**运行时**行为尚未实机验证。
 
 ## 快速开始
 
@@ -101,8 +106,8 @@ cargo build --release
 | `threshold` | `VA_WAKE_THRESHOLD` | 0.5 | 唤醒词检测阈值 |
 | `agent_mode` | — | readonly | kiro 权限：readonly / safe / full |
 | `agent_cmd` | `VA_AGENT_CMD` | kiro-cli acp --agent voice | ACP agent 启动命令（换后端只改这里） |
-| `tts` | `VA_TTS` | say (macOS) / off | 语音回复引擎：say / cmd / off |
-| `tts_voice` | `VA_TTS_VOICE` | 自动 | 音色，留空则按语言选（zh → Tingting） |
+| `tts` | `VA_TTS` | 按平台 | 语音回复引擎：say（macOS）/ sapi（Windows）/ espeak（Linux）/ cmd / off |
+| `tts_voice` | `VA_TTS_VOICE` | 自动 | 音色，留空则按语言选（zh → Tingting / cmn） |
 | `tts_rate` | `VA_TTS_RATE` | 0 | 语速（字/分钟），0 = 引擎默认 |
 | `tts_cmd` | `VA_TTS_CMD` | — | tts=cmd 时的 sidecar 命令（从 stdin 读文本、自己合成并播放）|
 | `silence_ms` | `VA_SILENCE_MS` | 1000 | 说完停顿多久算结束 |
@@ -120,7 +125,17 @@ cargo build --release
 
 ### 语音回复
 
-setup 第 5 步开关，默认在 macOS 上开启，引擎是系统内置的 `say`（零依赖）。
+setup 第 5 步开关，默认使用**系统自带**引擎，零额外安装：
+
+| 平台 | 引擎 | 说明 |
+|------|------|------|
+| macOS | `say` | 系统内置，中文默认 Tingting |
+| Windows | `sapi` | 经 PowerShell 调用 System.Speech，系统自带 |
+| Linux | `espeak` | 仅在 PATH 上有 `espeak-ng` 时启用，否则默认关闭 |
+
+Windows / Linux 的引擎命令行由代码构造（不经过配置文件的空格分词），要念的文本一律
+走 stdin 而非命令行参数——所以回答里出现什么字符都不会变成 shell/PowerShell 代码。
+这两个引擎音质一般且**尚未在实机验证**，追求自然度请用下面的 `tts=cmd` 接 Kokoro/Piper。
 
 - **边生成边念**：回答文字一到句子结尾（。！？；或换行）就立刻送去合成；长句子超过
   48 字还没标点，会在逗号处先切一段出来念，所以开口时机跟着生成走，不用等整段写完。
@@ -179,7 +194,8 @@ setup 重设或每次启动都会按当前唤醒词/权限重写，请勿手改�
 - **听不到唤醒**：`voice-assistant test-wake` 看得分，长期低于 0.5 可降低 `threshold`
 - **没有输入设备**：确认终端有麦克风权限；`voice-assistant devices` 列出设备
 - **中文识别差**：`setup` 换 small/medium 模型
-- **听不到语音回复**：`voice-assistant test-tts` 直接试；确认 `tts=say`（Linux 暂无内置引擎）
+- **听不到语音回复**：`voice-assistant test-tts` 直接试；`voice-assistant selftest` 会
+  打印当前引擎和平台默认值（Linux 需先装 `espeak-ng`，或用 `tts=cmd` 接 piper/kokoro）
 - **助手把自己的话当指令**：麦克风现在全程实时监听（为支持朗读中打断），只对唤醒词响应；
   外放且无 AEC 时若被自身声音误触，戴耳机可根治，或临时把 `tts` 调低音量/关掉
 - **agent 响应慢**：默认走 `kiro-cli acp --agent voice`（ACP 常驻进程，无 MCP 冷启动、多轮不重启）；`setup` 会自动配置

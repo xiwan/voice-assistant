@@ -1,0 +1,63 @@
+name: build
+
+# Windows and Linux cannot be verified on the author's Mac: whisper-rs and ort
+# both compile C/C++ and link platform audio APIs, so cross-checking locally
+# proves nothing. This matrix is the project's only honest evidence that the
+# three desktop targets still build and pass their unit tests.
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false # a Windows break must not hide a Linux break
+      matrix:
+        include:
+          - os: macos-latest
+            name: macOS (whisper Metal)
+          - os: ubuntu-latest
+            name: Linux (ALSA, CPU whisper)
+          - os: windows-latest
+            name: Windows (MSVC, CPU whisper)
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # cpal needs ALSA headers on Linux; whisper.cpp needs cmake everywhere.
+      - name: Linux system deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libasound2-dev pkg-config
+
+      - name: Check cmake is present
+        run: cmake --version
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}
+
+      # No model downloads and no microphone are involved: every unit test is a
+      # pure function (renderer, intent classifier, speech buffer, path lookup).
+      - name: Test
+        run: cargo test --release
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Binary runs
+        # `--help` is not implemented; an unknown subcommand exits 2 after the
+        # binary has loaded, which is enough to catch a broken link step.
+        shell: bash
+        run: |
+          ./target/release/voice-assistant __ci_probe__ && code=0 || code=$?
+          if [ "$code" != "2" ]; then
+            echo "expected exit 2 from the unknown-subcommand path, got $code"
+            exit 1
+          fi

@@ -21,10 +21,11 @@
 //! notifications (kiro's `_kiro.dev/*`) are ignored.
 
 use crate::tts::{SpeechBuffer, Tts};
+use crate::ui::{ToolState, Ui};
 use anyhow::{anyhow, bail, Context, Result};
 use crossbeam_channel::{unbounded, Receiver};
 use serde_json::{json, Value};
-use std::io::{BufRead, BufReader, IsTerminal, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -32,23 +33,11 @@ use std::time::{Duration, Instant};
 /// Protocol version we speak. ACP is currently at 1.
 const PROTOCOL_VERSION: i64 = 1;
 
-/// Longest tool title / thought line we echo, so progress stays one line.
-const MAX_STATUS_CHARS: usize = 96;
-
 /// A message read off the agent's stdout, or a signal that the stream ended.
 pub enum Incoming {
     Msg(Value),
     /// The agent closed stdout / the reader hit an error — the process is gone.
     Closed,
-}
-
-/// What the agent was last streaming, so we insert separators only when the
-/// output switches between reply text, thinking, and tool progress.
-#[derive(PartialEq)]
-enum Stream {
-    Idle,
-    Message,
-    Thought,
 }
 
 pub struct AcpConnection {
@@ -61,8 +50,9 @@ pub struct AcpConnection {
     /// Approve tool-permission requests (the "full" trust mode); otherwise
     /// reject anything the launched agent's own allow-list didn't permit.
     auto_approve: bool,
-    stream: Stream,
-    color: bool,
+    /// Where progress goes. The connection no longer prints: it describes what
+    /// happened and the front end decides how to show it.
+    ui: Ui,
     /// Spoken output. Only reply text is routed here — never thoughts or tool
     /// progress — and it is spoken sentence by sentence as the reply streams.
     tts: Tts,
@@ -75,7 +65,12 @@ impl AcpConnection {
     /// receiver the caller waits on. Keeping the receiver separate from the
     /// connection lets the supervisor `select!` on it while still holding
     /// `&mut AcpConnection` to handle each message.
-    pub fn connect(cmd: &[String], auto_approve: bool, tts: Tts) -> Result<(Self, Receiver<Incoming>)> {
+    pub fn connect(
+        cmd: &[String],
+        auto_approve: bool,
+        tts: Tts,
+        ui: Ui,
+    ) -> Result<(Self, Receiver<Incoming>)> {
         anyhow::ensure!(!cmd.is_empty(), "agent command is empty");
         let mut child = Command::new(&cmd[0])
             .args(&cmd[1..])
@@ -94,8 +89,7 @@ impl AcpConnection {
             session_id: String::new(),
             active_prompt: None,
             auto_approve,
-            stream: Stream::Idle,
-            color: std::io::stdout().is_terminal(),
+            ui,
             tts,
             speech: SpeechBuffer::default(),
         };
@@ -165,7 +159,6 @@ impl AcpConnection {
         let id = self.next_id;
         self.next_id += 1;
         self.active_prompt = Some(id);
-        self.stream = Stream::Idle;
         self.speech.reset();
         let session_id = self.session_id.clone();
         self.send(&json!({
@@ -220,11 +213,12 @@ impl AcpConnection {
                 // Response to a request we sent.
                 if self.active_prompt == Some(id) {
                     self.active_prompt = None;
-                    self.finish_line();
                     let stop = msg["result"]["stopReason"]
                         .as_str()
                         .unwrap_or("end_turn")
                         .to_string();
+                    // Lets the front end close a half-written line.
+                    self.ui.turn_end(&stop);
                     // Speak the tail of the reply (a last sentence without
                     // final punctuation). A cancelled turn stays silent.
                     match self.speech.flush() {
@@ -245,14 +239,13 @@ impl AcpConnection {
         None
     }
 
-    // ---- rendering ----
+    // ---- session/update -> events ----
 
     fn render_update(&mut self, update: &Value) {
         match update.get("sessionUpdate").and_then(Value::as_str).unwrap_or("") {
             "agent_message_chunk" => {
                 if let Some(text) = update["content"]["text"].as_str() {
-                    self.enter(Stream::Message, "");
-                    self.out(text);
+                    self.ui.reply(text);
                     // Reply text is the ONLY thing spoken; each sentence goes
                     // out as soon as it is complete, not at end of turn.
                     for sentence in self.speech.push(text) {
@@ -262,63 +255,24 @@ impl AcpConnection {
             }
             "agent_thought_chunk" => {
                 if let Some(text) = update["content"]["text"].as_str() {
-                    self.enter(Stream::Thought, "  · 思考: ");
-                    self.out(text);
+                    self.ui.thought(text);
                 }
             }
             "tool_call" => {
                 let title = update.get("title").and_then(Value::as_str).unwrap_or("tool");
-                self.status(&format!("  · {}...", truncate(title)));
+                self.ui.tool(title, ToolState::Started);
             }
             "tool_call_update" => {
                 let status = update.get("status").and_then(Value::as_str).unwrap_or("");
                 let title = update.get("title").and_then(Value::as_str).unwrap_or("tool");
                 match status {
-                    "completed" => self.status(&format!("  ✓ {}", truncate(title))),
-                    "failed" => self.status(&format!("  ✗ {} 失败", truncate(title))),
+                    "completed" => self.ui.tool(title, ToolState::Completed),
+                    "failed" => self.ui.tool(title, ToolState::Failed),
                     _ => {}
                 }
             }
             _ => {}
         }
-    }
-
-    /// Emit a trailing newline if a turn ended mid-line.
-    fn finish_line(&mut self) {
-        if self.stream != Stream::Idle {
-            self.out("\n");
-            self.stream = Stream::Idle;
-        }
-    }
-
-    fn enter(&mut self, next: Stream, lead: &str) {
-        if self.stream == next {
-            return;
-        }
-        if self.stream != Stream::Idle {
-            self.out("\n");
-        }
-        self.stream = next;
-        if !lead.is_empty() {
-            self.out(lead);
-        }
-    }
-
-    fn status(&mut self, line: &str) {
-        if self.stream != Stream::Idle {
-            self.out("\n");
-            self.stream = Stream::Idle;
-        }
-        if self.color {
-            self.out(&format!("\x1b[2m{line}\x1b[0m\n"));
-        } else {
-            self.out(&format!("{line}\n"));
-        }
-    }
-
-    fn out(&self, s: &str) {
-        print!("{s}");
-        let _ = std::io::stdout().flush();
     }
 
     fn send(&mut self, msg: &Value) -> Result<()> {
@@ -348,8 +302,8 @@ impl AcpConnection {
                     None
                 }
             });
-            let verdict = if self.auto_approve { "已批准" } else { "已拒绝（权限模式）" };
-            self.status(&format!("  · {} 请求授权 → {verdict}", truncate(&tool)));
+            let verdict = self.auto_approve;
+            self.ui.tool(&tool, ToolState::Permission { approved: verdict });
             match picked {
                 Some(opt) => json!({ "outcome": { "outcome": "selected", "optionId": opt } }),
                 None => json!({ "outcome": { "outcome": "cancelled" } }),
@@ -406,37 +360,4 @@ fn spawn_reader(stdout: ChildStdout) -> Receiver<Incoming> {
         }
     });
     rx
-}
-
-/// Clip a status line to `MAX_STATUS_CHARS` chars (char-wise, so multi-byte
-/// titles are never split) and flatten embedded newlines.
-fn truncate(s: &str) -> String {
-    let flat = s.replace(['\n', '\r'], " ");
-    if flat.chars().count() <= MAX_STATUS_CHARS {
-        return flat;
-    }
-    flat.chars().take(MAX_STATUS_CHARS).collect::<String>() + "…"
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn short_titles_pass_through() {
-        assert_eq!(truncate("hello"), "hello");
-    }
-
-    #[test]
-    fn long_titles_are_clipped() {
-        let s = "x".repeat(200);
-        let t = truncate(&s);
-        assert_eq!(t.chars().count(), MAX_STATUS_CHARS + 1); // + the ellipsis
-        assert!(t.ends_with('…'));
-    }
-
-    #[test]
-    fn newlines_flattened() {
-        assert_eq!(truncate("a\nb\rc"), "a b c");
-    }
 }

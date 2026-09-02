@@ -76,7 +76,7 @@ impl Default for Settings {
             silence_ms: 1000,
             no_speech_ms: 6000,
             max_utterance_ms: 30000,
-            tts: if cfg!(target_os = "macos") { "say".into() } else { "off".into() },
+            tts: default_tts_id().into(),
             tts_voice: String::new(),
             tts_rate: 0,
             tts_cmd: String::new(),
@@ -84,8 +84,50 @@ impl Default for Settings {
     }
 }
 
+/// The built-in speech engine for this platform, or "off" when there is none.
+///
+/// macOS has `say` and Windows has SAPI (through PowerShell), both preinstalled.
+/// Linux has nothing guaranteed, so espeak-ng is used when it happens to be
+/// installed and speech otherwise starts out disabled — `tts=cmd` with
+/// piper/kokoro stays the good-quality path on every platform.
+pub fn default_tts_id() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "say"
+    } else if cfg!(target_os = "windows") {
+        "sapi"
+    } else if which_on_path("espeak-ng") {
+        "espeak"
+    } else {
+        "off"
+    }
+}
+
+/// Home directory, portably.
+///
+/// Windows has no `HOME` — it has `USERPROFILE` (and `HOMEDRIVE`+`HOMEPATH` on
+/// older setups). The previous `unwrap_or(".")` meant a Windows run silently
+/// wrote its config and up to 1.5GB of models into whatever directory the binary
+/// happened to be launched from.
+pub fn home() -> PathBuf {
+    home_from(|k| std::env::var(k).ok())
+}
+
+fn home_from(get: impl Fn(&str) -> Option<String>) -> PathBuf {
+    if let Some(h) = get("HOME").filter(|h| !h.is_empty()) {
+        return PathBuf::from(h);
+    }
+    if let Some(h) = get("USERPROFILE").filter(|h| !h.is_empty()) {
+        return PathBuf::from(h);
+    }
+    match (get("HOMEDRIVE"), get("HOMEPATH")) {
+        (Some(d), Some(p)) if !d.is_empty() && !p.is_empty() => PathBuf::from(format!("{d}{p}")),
+        // Last resort, same as before: better than refusing to start.
+        _ => PathBuf::from("."),
+    }
+}
+
 pub fn base_dir() -> PathBuf {
-    PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into())).join(".voice-assistant")
+    home().join(".voice-assistant")
 }
 
 pub fn models_dir() -> PathBuf {
@@ -100,16 +142,27 @@ fn config_path() -> PathBuf {
 
 /// Whether `bin` resolves to an existing file (absolute/relative path) or is
 /// found on $PATH. Unix-only lookup, which matches this project's targets.
-fn which_on_path(bin: &str) -> bool {
-    if bin.contains('/') {
+/// Is `bin` runnable? Handles the three things that differ on Windows: `;`
+/// instead of `:` between PATH entries, `\` as the path separator, and the fact
+/// that an executable is `foo.exe` / `foo.cmd` rather than bare `foo`.
+pub fn which_on_path(bin: &str) -> bool {
+    let path = std::env::var("PATH").unwrap_or_default();
+    which_in(bin, &path, cfg!(target_os = "windows"))
+}
+
+fn which_in(bin: &str, path: &str, windows: bool) -> bool {
+    if bin.contains('/') || (windows && bin.contains('\\')) {
         return PathBuf::from(bin).exists();
     }
-    std::env::var("PATH")
-        .map(|path| {
-            path.split(':')
-                .any(|dir| PathBuf::from(dir).join(bin).exists())
-        })
-        .unwrap_or(false)
+    let sep = if windows { ';' } else { ':' };
+    let candidates: Vec<String> = if windows {
+        ["", ".exe", ".cmd", ".bat"].iter().map(|e| format!("{bin}{e}")).collect()
+    } else {
+        vec![bin.to_string()]
+    };
+    path.split(sep)
+        .filter(|d| !d.is_empty())
+        .any(|dir| candidates.iter().any(|c| PathBuf::from(dir).join(c).exists()))
 }
 
 /// Load persisted settings, if a config file exists.
@@ -272,10 +325,10 @@ pub fn interactive_setup(existing: Option<Settings>) -> Result<Settings> {
         (c, mode)
     };
 
-    // 5) Spoken replies. Half duplex: the mic is muted while speaking, so a
-    //    long answer can't be interrupted by voice mid-sentence.
+    // 5) Spoken replies. The mic keeps listening while speaking, so the wake
+    //    word can cut a long answer short.
     println!("\n5) 语音回复 (把回答念出来):");
-    println!("   1. 开   (macOS 内置 say, 边生成边念)");
+    println!("   1. 开   (系统内置引擎: macOS say / Windows SAPI / Linux espeak-ng, 边生成边念)");
     println!("   2. 关   (只在终端显示文字)");
     println!("   3. 自定义命令 (外部 TTS sidecar, 如 Kokoro/Piper: 从 stdin 读文本, 自己合成并播放)");
     let cur_tts_idx = match cur.tts.as_str() {
@@ -305,11 +358,23 @@ pub fn interactive_setup(existing: Option<Settings>) -> Result<Settings> {
             ("cmd".to_string(), cur.tts_voice.clone(), cur.tts_rate, c)
         }
         _ => {
-            let v = ask("音色 (留空=按语言自动, 中文用 Tingting; `say -v ?` 看全部)", &cur.tts_voice);
+            let id = default_tts_id();
+            if id == "off" {
+                println!(
+                    "   ⚠️  这台机器没有内置语音引擎 (未找到 espeak-ng)。"
+                );
+                println!(
+                    "      先 `apt install espeak-ng` 再重跑 setup, 或用选项 3 接 piper/kokoro。"
+                );
+            }
+            let v = ask(
+                "音色 (留空=按语言自动; macOS 中文用 Tingting, 看全部: `say -v ?`)",
+                &cur.tts_voice,
+            );
             let r = ask("语速 (字/分钟, 0=默认)", &cur.tts_rate.to_string())
                 .parse()
                 .unwrap_or(cur.tts_rate);
-            ("say".to_string(), v, r, cur.tts_cmd.clone())
+            (id.to_string(), v, r, cur.tts_cmd.clone())
         }
     };
 
@@ -418,9 +483,7 @@ pub fn write_agent_config(mode: &str, persona: &str) -> Result<()> {
 "#
         ),
     };
-    let dir = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
-        .join(".kiro")
-        .join("agents");
+    let dir = home().join(".kiro").join("agents");
     fs::create_dir_all(&dir)?;
     fs::write(dir.join("voice.json"), body)?;
     Ok(())
@@ -503,4 +566,72 @@ fn download(url: &str, path: &std::path::Path) -> Result<()> {
     fs::rename(&tmp, path)?;
     eprintln!("[setup] 完成 {name} ({:.1} MB)", bytes as f64 / 1_048_576.0);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Fake environment so the platform running the test doesn't decide.
+    fn env<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |k| {
+            pairs
+                .iter()
+                .find(|(n, _)| *n == k)
+                .map(|(_, v)| (*v).to_string())
+        }
+    }
+
+    #[test]
+    fn home_prefers_unix_home() {
+        assert_eq!(
+            home_from(env(&[("HOME", "/Users/x"), ("USERPROFILE", "C:\\Users\\x")])),
+            PathBuf::from("/Users/x")
+        );
+    }
+
+    #[test]
+    fn home_falls_back_to_userprofile_on_windows() {
+        assert_eq!(
+            home_from(env(&[("USERPROFILE", "C:\\Users\\x")])),
+            PathBuf::from("C:\\Users\\x")
+        );
+    }
+
+    #[test]
+    fn home_falls_back_to_homedrive_plus_homepath() {
+        assert_eq!(
+            home_from(env(&[("HOMEDRIVE", "C:"), ("HOMEPATH", "\\Users\\x")])),
+            PathBuf::from("C:\\Users\\x")
+        );
+    }
+
+    /// An empty variable must not win: it used to produce `/.voice-assistant`.
+    #[test]
+    fn home_ignores_empty_values() {
+        assert_eq!(
+            home_from(env(&[("HOME", ""), ("USERPROFILE", "C:\\Users\\x")])),
+            PathBuf::from("C:\\Users\\x")
+        );
+    }
+
+    #[test]
+    fn home_last_resort_is_cwd() {
+        assert_eq!(home_from(env(&[])), PathBuf::from("."));
+    }
+
+    #[test]
+    fn path_lookup_uses_the_platform_separator() {
+        // A directory that certainly exists on the unix side of the test host.
+        let unix_path = "/nonexistent:/usr/bin";
+        assert!(which_in("env", unix_path, false));
+        // With ';' assumed, the whole string is one bogus directory.
+        assert!(!which_in("env", unix_path, true));
+    }
+
+    #[test]
+    fn explicit_paths_are_checked_directly() {
+        assert!(which_in("/usr/bin/env", "", false));
+        assert!(!which_in("/definitely/not/here", "", false));
+    }
 }

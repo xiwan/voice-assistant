@@ -84,6 +84,17 @@ impl Engine {
                     Engine::Cmd { argv }
                 }
             }
+            // Windows' built-in engine, reached through PowerShell's
+            // System.Speech. It fits the sidecar contract exactly: read stdin,
+            // speak, exit — so `Engine::Cmd` carries it and 停 can kill it.
+            // argv is built here rather than stored in `tts_cmd`, because the
+            // config parser splits that on whitespace and this script is full
+            // of spaces. The text itself travels on stdin, never in argv, so
+            // nothing the agent says can end up as PowerShell code.
+            "sapi" => Engine::Cmd { argv: sapi_argv(voice, rate) },
+            // Linux has no guaranteed engine; espeak-ng is the one that is
+            // usually a package away. Robotic, but audible without downloads.
+            "espeak" => Engine::Cmd { argv: espeak_argv(voice, rate, lang) },
             _ => Engine::Off,
         }
     }
@@ -92,8 +103,7 @@ impl Engine {
         !matches!(self, Engine::Off)
     }
 
-    /// Start speaking `text`, returning the playback process so the caller can
-    /// wait on it or kill it (interruption).
+    /// Start speaking `text`, returning the playback process so the caller can    /// wait on it or kill it (interruption).
     fn start(&self, text: &str) -> Result<Child> {
         match self {
             Engine::Off => Err(anyhow!("tts disabled")),
@@ -138,6 +148,57 @@ impl Engine {
             }
         }
     }
+}
+
+/// PowerShell one-liner that speaks whatever arrives on stdin, then exits.
+/// Only the voice name is interpolated (and single quotes are escaped); the
+/// utterance goes over stdin so it can never be interpreted as script.
+fn sapi_argv(voice: &str, rate: u32) -> Vec<String> {
+    let mut script = String::from(
+        "Add-Type -AssemblyName System.Speech; \
+         $s = New-Object System.Speech.Synthesis.SpeechSynthesizer;",
+    );
+    let v = voice.trim();
+    if !v.is_empty() {
+        script += &format!(" $s.SelectVoice('{}');", v.replace('\'', "''"));
+    }
+    if rate > 0 {
+        script += &format!(" $s.Rate = {};", sapi_rate(rate));
+    }
+    script += " $s.Speak([Console]::In.ReadToEnd())";
+    vec![
+        "powershell".into(),
+        "-NoProfile".into(),
+        "-ExecutionPolicy".into(),
+        "Bypass".into(),
+        "-Command".into(),
+        script,
+    ]
+}
+
+/// SAPI's rate is -10..10, not words per minute, so the configured wpm has to
+/// be mapped. ~200 wpm is SAPI's 0; each step is roughly 20 wpm.
+fn sapi_rate(wpm: u32) -> i32 {
+    (((wpm as f32 - 200.0) / 20.0).round() as i32).clamp(-10, 10)
+}
+
+/// espeak-ng reads the utterance from stdin with `--stdin` and plays it itself,
+/// which is the sidecar contract. `cmn` is its Mandarin voice.
+fn espeak_argv(voice: &str, rate: u32, lang: &str) -> Vec<String> {
+    let mut argv = vec!["espeak-ng".to_string(), "--stdin".to_string()];
+    let v = match voice.trim() {
+        "" if lang.starts_with("zh") => "cmn",
+        other => other,
+    };
+    if !v.is_empty() {
+        argv.push("-v".into());
+        argv.push(v.into());
+    }
+    if rate > 0 {
+        argv.push("-s".into()); // espeak-ng takes words per minute directly
+        argv.push(rate.to_string());
+    }
+    argv
 }
 
 enum Cmd {
@@ -553,5 +614,59 @@ mod tests {
         }
         // Empty command -> disabled (never mutes / never spawns).
         assert!(!Engine::resolve("cmd", "", 0, "   ", "zh").enabled());
+    }
+
+    /// The SAPI script must arrive as ONE argv entry. If it were ever routed
+    /// through the whitespace-splitting config parser it would shatter into
+    /// dozens of arguments and PowerShell would run nothing.
+    #[test]
+    fn sapi_script_is_a_single_argument() {
+        match Engine::resolve("sapi", "", 0, "", "zh") {
+            Engine::Cmd { argv } => {
+                assert_eq!(argv[0], "powershell");
+                assert_eq!(argv.len(), 6, "{argv:?}");
+                assert!(argv[5].contains("System.Speech"));
+                assert!(argv[5].contains("[Console]::In.ReadToEnd()"));
+                // The utterance travels on stdin, never inside the script.
+                assert!(!argv[5].contains("Speak('"));
+            }
+            e => panic!("unexpected engine {e:?}"),
+        }
+    }
+
+    #[test]
+    fn sapi_voice_names_are_escaped() {
+        match Engine::resolve("sapi", "O'Brien", 0, "", "en") {
+            Engine::Cmd { argv } => assert!(argv[5].contains("SelectVoice('O''Brien')"), "{argv:?}"),
+            e => panic!("unexpected engine {e:?}"),
+        }
+    }
+
+    /// SAPI's scale is -10..10, so a words-per-minute setting has to be mapped
+    /// rather than passed through.
+    #[test]
+    fn sapi_rate_maps_wpm_into_range() {
+        assert_eq!(sapi_rate(200), 0);
+        assert_eq!(sapi_rate(300), 5);
+        assert_eq!(sapi_rate(100), -5);
+        assert_eq!(sapi_rate(10_000), 10); // clamped
+        assert_eq!(sapi_rate(1), -10); // clamped
+    }
+
+    #[test]
+    fn espeak_picks_mandarin_for_chinese() {
+        match Engine::resolve("espeak", "", 0, "", "zh") {
+            Engine::Cmd { argv } => {
+                assert_eq!(argv[0], "espeak-ng");
+                assert!(argv.contains(&"--stdin".to_string()), "{argv:?}");
+                assert!(argv.windows(2).any(|w| w == ["-v", "cmn"]), "{argv:?}");
+            }
+            e => panic!("unexpected engine {e:?}"),
+        }
+        // English: no voice flag, let espeak-ng use its default.
+        match Engine::resolve("espeak", "", 0, "", "en") {
+            Engine::Cmd { argv } => assert!(!argv.contains(&"-v".to_string()), "{argv:?}"),
+            e => panic!("unexpected engine {e:?}"),
+        }
     }
 }

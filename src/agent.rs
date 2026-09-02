@@ -23,6 +23,7 @@
 
 use crate::acp::{AcpConnection, Incoming};
 use crate::tts::Tts;
+use crate::ui::Ui;
 use crossbeam_channel::{select, unbounded, Receiver, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::Duration;
@@ -58,10 +59,12 @@ impl AgentHandle {
     /// Start the supervisor thread and return a handle to it.
     /// `tts` is handed to each connection so reply text can be spoken as it
     /// streams; it survives agent restarts because the handle is cloneable.
-    pub fn spawn(cmd: Vec<String>, auto_approve: bool, tts: Tts) -> Self {
+    /// `ui` is likewise handed down, so progress reaches whatever front end is
+    /// attached (terminal or window) instead of being printed here.
+    pub fn spawn(cmd: Vec<String>, auto_approve: bool, tts: Tts, ui: Ui) -> Self {
         let (cmd_tx, cmd_rx) = unbounded::<AgentCmd>();
         let (state_tx, state_rx) = unbounded::<AgentState>();
-        thread::spawn(move || supervisor(cmd, auto_approve, tts, cmd_rx, state_tx));
+        thread::spawn(move || supervisor(cmd, auto_approve, tts, ui, cmd_rx, state_tx));
         AgentHandle { cmd_tx, state_rx }
     }
 
@@ -86,12 +89,13 @@ fn supervisor(
     cmd: Vec<String>,
     auto_approve: bool,
     tts: Tts,
+    ui: Ui,
     cmd_rx: Receiver<AgentCmd>,
     state_tx: Sender<AgentState>,
 ) {
     let mut backoff = BACKOFF_START;
     loop {
-        match AcpConnection::connect(&cmd, auto_approve, tts.clone()) {
+        match AcpConnection::connect(&cmd, auto_approve, tts.clone(), ui.clone()) {
             Ok((mut conn, incoming)) => {
                 backoff = BACKOFF_START; // healthy connection resets backoff
                 let _ = state_tx.send(AgentState::Ready);

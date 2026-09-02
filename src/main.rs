@@ -26,16 +26,18 @@ mod asr;
 mod audio;
 mod setup;
 mod tts;
+mod ui;
 mod vad;
 mod wakeword;
 
 use agent::{AgentHandle, AgentState};
 use anyhow::Result;
-use crossbeam_channel::Receiver;
+use crossbeam_channel::{never, select, Receiver};
 use std::io::IsTerminal;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
+use ui::{Ui, UiCommand};
 use vad::VAD_CHUNK;
 
 struct Config {
@@ -160,6 +162,20 @@ fn main() -> Result<()> {
         }
         _ => {}
     }
+    // Reject an unknown subcommand *before* `Config::load`, which runs first-run
+    // setup and can download up to 1.5GB of models — a silly thing to do on the
+    // way to printing "unknown command". It also gives CI a cheap way to prove
+    // the binary links and starts on a machine with no models and no mic.
+    const CMDS: &[&str] = &[
+        "selftest", "vad-wav", "test-wake", "test-vad", "test-asr", "test-tts", "ask",
+        "agent-test", "events",
+    ];
+    if let Some(other) = std::env::args().nth(1) {
+        if !CMDS.contains(&other.as_str()) {
+            eprintln!("unknown command: {other}");
+            std::process::exit(2);
+        }
+    }
     let cfg = Config::load()?;
     match std::env::args().nth(1).as_deref() {
         Some("selftest") => selftest(&cfg),
@@ -170,10 +186,8 @@ fn main() -> Result<()> {
         Some("test-tts") => test_tts(&cfg),
         Some("ask") => ask_cli(&cfg),
         Some("agent-test") => agent_test(&cfg),
-        Some(other) => {
-            eprintln!("unknown command: {other}");
-            std::process::exit(2);
-        }
+        Some("events") => events_cli(&cfg),
+        Some(other) => unreachable!("unknown command {other} is rejected above"),
         None => run(&cfg),
     }
 }
@@ -261,7 +275,12 @@ fn ask_cli(cfg: &Config) -> Result<()> {
     sync_persona(cfg);
     eprintln!("[acp] starting agent: {}", cfg.agent_cmd.join(" "));
     let speaker = tts::Tts::spawn(cfg.tts_engine.clone(), Arc::new(AtomicBool::new(false)));
-    let agent = AgentHandle::spawn(cfg.agent_cmd.clone(), cfg.auto_approve, speaker.clone());
+    let agent = AgentHandle::spawn(
+        cfg.agent_cmd.clone(),
+        cfg.auto_approve,
+        speaker.clone(),
+        Ui::terminal(&cfg.persona),
+    );
     for (i, p) in prompts.iter().enumerate() {
         println!("\n>> [{}] {p}", i + 1);
         agent.prompt(p.clone());
@@ -283,7 +302,12 @@ fn agent_test(cfg: &Config) -> Result<()> {
     sync_persona(cfg);
     eprintln!("[agent-test] launching: {}", cfg.agent_cmd.join(" "));
     let silent = tts::Tts::spawn(tts::Engine::Off, Arc::new(AtomicBool::new(false)));
-    let agent = AgentHandle::spawn(cfg.agent_cmd.clone(), cfg.auto_approve, silent);
+    let agent = AgentHandle::spawn(
+        cfg.agent_cmd.clone(),
+        cfg.auto_approve,
+        silent,
+        Ui::terminal(&cfg.persona),
+    );
 
     // Consume states until the next Idle, printing each transition. Returns the
     // stopReason, or None if the agent channel closed.
@@ -320,7 +344,57 @@ fn agent_test(cfg: &Config) -> Result<()> {
 
 // ---------------- full pipeline ----------------
 
+/// Hidden headless check of the front-end seam: drive one prompt through the
+/// agent with a *channel* front end instead of the terminal and dump every
+/// `UiEvent` it produces. This is how the event stream is verified without a
+/// mic and without a window — if a window shows nothing, compare against this.
+///   voice-assistant events "说三句话，每句一行"
+fn events_cli(cfg: &Config) -> Result<()> {
+    let prompt = std::env::args()
+        .nth(2)
+        .unwrap_or_else(|| "用一句话介绍你自己".to_string());
+    sync_persona(cfg);
+    eprintln!("[acp] starting agent: {}", cfg.agent_cmd.join(" "));
+    let (ui, events) = Ui::channel();
+    let silent = tts::Tts::spawn(tts::Engine::Off, Arc::new(AtomicBool::new(false)));
+    let agent = AgentHandle::spawn(cfg.agent_cmd.clone(), cfg.auto_approve, silent, ui.clone());
+
+    // A front end also sees what the state machine reports, not just the agent.
+    ui.ready(&cfg.wake_display);
+    ui.transcript(&prompt);
+    ui.busy(true);
+    agent.prompt(prompt);
+
+    // Print events as they arrive until the turn ends.
+    let mut n = 0usize;
+    loop {
+        match events.recv_timeout(Duration::from_secs(120)) {
+            Ok(ev) => {
+                n += 1;
+                println!("[ev {n:>3}] {ev:?}");
+                if let ui::UiEvent::TurnEnd { .. } = ev {
+                    break;
+                }
+            }
+            Err(_) => {
+                eprintln!("[events] timed out waiting for the turn to end");
+                break;
+            }
+        }
+    }
+    ui.busy(false);
+    agent.shutdown();
+    println!("[events] {n} events");
+    Ok(())
+}
+
 fn run(cfg: &Config) -> Result<()> {
+    // The terminal is just one front end; a window swaps in here (v0.11.0) by
+    // passing `Ui::channel()` and a real command receiver instead.
+    run_with(cfg, Ui::terminal(&cfg.persona), never::<UiCommand>())
+}
+
+fn run_with(cfg: &Config, ui: Ui, commands: Receiver<UiCommand>) -> Result<()> {
     let mut wake = cfg.wakeword()?;
     let mut vad = cfg.vad()?;
     let asr = cfg.asr()?;
@@ -341,12 +415,14 @@ fn run(cfg: &Config) -> Result<()> {
     // blocks on a reply, so it can always hear the wake word — including
     // "Jarvis, 停" to interrupt a running task. Exactly one agent is kept alive.
     eprintln!("[acp] starting agent: {}", cfg.agent_cmd.join(" "));
-    let agent = AgentHandle::spawn(cfg.agent_cmd.clone(), cfg.auto_approve, speaker.clone());
-
-    println!(
-        "== voice assistant ready, say the wake word (\"{}\") ==",
-        cfg.wake_display
+    let agent = AgentHandle::spawn(
+        cfg.agent_cmd.clone(),
+        cfg.auto_approve,
+        speaker.clone(),
+        ui.clone(),
     );
+
+    ui.ready(&cfg.wake_display);
 
     // `Conv` holds the conversation state (busy / follow-up window / the running
     // task / a paused-and-resumable task).
@@ -358,16 +434,21 @@ fn run(cfg: &Config) -> Result<()> {
         // handle_command (暂停/取消), so we stay quiet on those here.
         for st in agent.state_rx.try_iter() {
             match st {
-                AgentState::Busy => conv.busy = true,
+                AgentState::Busy => {
+                    conv.busy = true;
+                    ui.busy(true);
+                }
                 AgentState::Idle(reason) => {
                     if reason != "cancelled" && conv.busy {
                         conv.followup = true; // real reply -> listen without re-waking
                     }
                     conv.busy = false;
+                    ui.busy(false);
                 }
                 AgentState::Restarting(r) => {
-                    eprintln!(">> agent 重启中: {r}");
+                    ui.restarting(&r);
                     conv.busy = false;
+                    ui.busy(false);
                 }
                 AgentState::Ready => {}
             }
@@ -381,10 +462,10 @@ fn run(cfg: &Config) -> Result<()> {
             vad.reset();
             wake.reset();
             match record_utterance(&rx, &mut vad, cfg)? {
-                Some(audio) => handle_command(audio, &asr, &agent, &speaker, &mut conv),
+                Some(audio) => handle_command(audio, &asr, &agent, &speaker, &ui, &mut conv),
                 None => {
                     let bye = "好的，我先下线待机了，需要时再叫我。";
-                    println!(">> {}: {bye}", cfg.persona);
+                    ui.spoken(bye);
                     speaker.say(bye);
                 }
             }
@@ -392,21 +473,44 @@ fn run(cfg: &Config) -> Result<()> {
         }
 
         // Wake-word gate. Block on audio exactly like the proven pipeline so the
-        // streaming detector is fed a continuous, gap-free stream.
-        let chunk = rx.recv()?;
+        // streaming detector is fed a continuous, gap-free stream (v0.6.1 broke
+        // when this went non-blocking). A front-end command is the only other
+        // thing that may wake this select, and those are rare, so the detector's
+        // input stays gap-free.
+        let chunk = select! {
+            recv(rx) -> c => c?,
+            recv(commands) -> c => {
+                match c {
+                    // The front end went away (window closed) -> shut down, same
+                    // as an explicit Quit. In terminal mode `commands` is
+                    // `never()`, so this arm is unreachable.
+                    Ok(UiCommand::Quit) | Err(_) => {
+                        speaker.stop();
+                        speaker.shutdown();
+                        agent.shutdown();
+                        return Ok(());
+                    }
+                    Ok(cmd) => {
+                        let (intent, text) = from_command(cmd);
+                        act(intent, text, &agent, &speaker, &ui, &mut conv);
+                        continue;
+                    }
+                }
+            }
+        };
         let Some(score) = wake.feed(&chunk)? else {
             continue;
         };
+        ui.wake_score(score);
         if score < cfg.wake_threshold {
             continue;
         }
-        let hint = if conv.busy { "，打断中" } else { "" };
-        println!("\x07>> wake word detected (score {score:.2}){hint}, listening...");
+        ui.wake(score, conv.busy);
         speaker.stop(); // stop talking the moment the user speaks up
         vad.reset();
         match record_utterance(&rx, &mut vad, cfg)? {
-            Some(audio) => handle_command(audio, &asr, &agent, &speaker, &mut conv),
-            None => println!(">> 没听到指令，回到待机"),
+            Some(audio) => handle_command(audio, &asr, &agent, &speaker, &ui, &mut conv),
+            None => ui.no_speech(),
         }
         wake.reset();
     }
@@ -440,50 +544,77 @@ struct Conv {
     resumable: Option<String>,
 }
 
-/// Transcribe an utterance and dispatch by intent: pause remembers the running
-/// task for later; resume re-launches it; abandon clears it; anything else is a
-/// new request (the supervisor auto-redirects if a turn is already running).
+/// Transcribe an utterance and dispatch it. Everything after the transcript is
+/// shared with front-end commands via `act`, so a button and a spoken phrase
+/// take exactly the same path.
 fn handle_command(
     audio: Vec<i16>,
     asr: &asr::Asr,
     agent: &AgentHandle,
     speaker: &tts::Tts,
+    ui: &Ui,
     conv: &mut Conv,
 ) {
     let text = match asr.transcribe(&audio) {
         Ok(t) if t.is_empty() => {
-            println!(">> 没听清，请再说一次");
+            ui.notice("没听清，请再说一次");
             return;
         }
         Ok(t) => t,
         Err(e) => {
-            eprintln!(">> transcription failed: {e}");
+            ui.error(format!("transcription failed: {e}"));
             return;
         }
     };
-    println!(">> you said: {text}");
-    // The user is talking to us: stop reading the previous answer out loud.
+    ui.transcript(&text);
+    act(classify_intent(&text), text, agent, speaker, ui, conv);
+}
+
+/// Map a front-end command onto the same intents speech produces. `Quit` is
+/// handled by the caller (it tears the pipeline down) and never reaches here.
+fn from_command(cmd: UiCommand) -> (Intent, String) {
+    match cmd {
+        UiCommand::Prompt(text) => (Intent::New, text),
+        UiCommand::Pause => (Intent::Pause, String::new()),
+        UiCommand::Resume => (Intent::Resume, String::new()),
+        UiCommand::Abandon | UiCommand::Quit => (Intent::Abandon, String::new()),
+    }
+}
+
+/// Apply an intent: pause remembers the running task for later; resume
+/// re-launches it; abandon clears it; anything else is a new request (the
+/// supervisor auto-redirects if a turn is already running). `text` is the
+/// request for `Intent::New` and unused otherwise.
+fn act(
+    intent: Intent,
+    text: String,
+    agent: &AgentHandle,
+    speaker: &tts::Tts,
+    ui: &Ui,
+    conv: &mut Conv,
+) {
+    // The user is doing something: stop reading the previous answer out loud.
     speaker.stop();
-    match classify_intent(&text) {
+    match intent {
         Intent::Pause => {
             if conv.busy {
                 agent.cancel();
                 conv.resumable = conv.current_task.clone();
                 conv.busy = false;
                 conv.followup = true; // keep listening for the interjection or 继续
-                println!(">> 已暂停，说“继续”接着做，或直接下别的指令");
+                ui.notice("已暂停，说“继续”接着做，或直接下别的指令");
             } else {
-                println!(">> 现在没有进行中的任务");
+                ui.notice("现在没有进行中的任务");
             }
         }
         Intent::Resume => {
             if let Some(task) = conv.resumable.take() {
-                println!(">> 继续刚才的任务");
+                ui.notice("继续刚才的任务");
                 agent.prompt(resume_prompt(&task));
                 conv.current_task = Some(task);
                 conv.busy = true;
             } else {
-                println!(">> 没有可继续的任务");
+                ui.notice("没有可继续的任务");
             }
         }
         Intent::Abandon => {
@@ -493,10 +624,10 @@ fn handle_command(
             conv.busy = false;
             conv.current_task = None;
             conv.resumable = None;
-            println!(">> 好的，取消了");
+            ui.notice("好的，取消了");
         }
         Intent::New => {
-            println!(">> asking agent...\n");
+            ui.notice("asking agent...");
             agent.prompt(text.clone());
             conv.current_task = Some(text);
             conv.busy = true;
@@ -620,14 +751,32 @@ fn selftest(cfg: &Config) -> Result<()> {
     let text = asr.transcribe(&vec![0i16; 16000])?;
     println!("[ok] asr: silence -> {:?}", text);
 
-    // 4. kiro-cli present on PATH
-    let out = std::process::Command::new("kiro-cli").arg("--version").output();
-    match out {
-        Ok(o) if o.status.success() => println!(
-            "[ok] kiro-cli: {}",
-            String::from_utf8_lossy(&o.stdout).trim()
-        ),
-        _ => println!("[!!] kiro-cli not found on PATH"),
+    // 4. the *configured* agent backend is reachable. Hardcoding kiro-cli here
+    //    made every custom ACP backend look broken.
+    let bin = cfg.agent_cmd.first().cloned().unwrap_or_default();
+    if bin.is_empty() {
+        println!("[!!] agent 命令为空 (检查 agent_cmd / VA_AGENT_CMD)");
+    } else if !setup::which_on_path(&bin) {
+        println!("[!!] agent 后端 '{bin}' 不在 PATH 上");
+    } else if bin == "kiro-cli" {
+        // Only the backend we manage is probed with --version: an arbitrary
+        // agent might not know the flag and could block waiting on stdin.
+        let out = std::process::Command::new(&bin).arg("--version").output();
+        match out {
+            Ok(o) if o.status.success() => {
+                println!("[ok] kiro-cli: {}", String::from_utf8_lossy(&o.stdout).trim())
+            }
+            _ => println!("[!!] kiro-cli 在 PATH 上但 --version 失败"),
+        }
+    } else {
+        println!("[ok] agent 后端: {bin} (在 PATH 上)");
+    }
+
+    // 5. spoken output: is the configured engine actually usable here?
+    if cfg.tts_engine.enabled() {
+        println!("[ok] tts: {:?}", cfg.tts_engine);
+    } else {
+        println!("[--] tts: 关闭 (平台默认 = {})", setup::default_tts_id());
     }
 
     println!("selftest done");
@@ -772,5 +921,21 @@ mod tests {
         let p = resume_prompt("把报告写完");
         assert!(p.contains("把报告写完"));
         assert!(p.contains("继续"));
+    }
+
+    /// A button and a spoken phrase must reach the same intent, otherwise the
+    /// window and the voice path would drift apart.
+    #[test]
+    fn front_end_commands_map_onto_voice_intents() {
+        assert_eq!(
+            from_command(UiCommand::Prompt("列出文件".into())),
+            (Intent::New, "列出文件".to_string())
+        );
+        assert_eq!(from_command(UiCommand::Pause).0, Intent::Pause);
+        assert_eq!(from_command(UiCommand::Resume).0, Intent::Resume);
+        assert_eq!(from_command(UiCommand::Abandon).0, Intent::Abandon);
+        // Quit tears the pipeline down in the caller; if it ever gets here it
+        // must at least not leave a task running.
+        assert_eq!(from_command(UiCommand::Quit).0, Intent::Abandon);
     }
 }
