@@ -17,10 +17,10 @@
 //!   VA_WHISPER_MODEL   explicit whisper ggml model path
 //!   VA_LANG            ASR language: auto/zh/en/...
 //!   VA_ASR_PROMPT      whisper initial prompt
-//!   VA_KIRO_ARGS       extra kiro-cli args, space separated (e.g. "--agent foo")
+//!   VA_AGENT_CMD       ACP agent launch command (default: "kiro-cli acp --agent voice")
 //!   VA_HF_BASE         HuggingFace endpoint (default: https://hf-mirror.com)
 
-mod agent;
+mod acp;
 mod asr;
 mod audio;
 mod setup;
@@ -41,7 +41,10 @@ struct Config {
     whisper_model: String,
     lang: String,
     asr_prompt: Option<String>,
-    kiro_args: Vec<String>,
+    /// Full argv used to launch the ACP agent process (kept alive across turns).
+    agent_cmd: Vec<String>,
+    /// Auto-approve tool-permission requests (maps from the "full" trust mode).
+    auto_approve: bool,
     silence_ms: f32,
     no_speech_ms: f32,
     max_utterance_ms: f32,
@@ -86,10 +89,11 @@ impl Config {
             ),
             lang,
             asr_prompt,
-            kiro_args: env("VA_KIRO_ARGS", &settings.kiro_args)
+            agent_cmd: env("VA_AGENT_CMD", &settings.agent_cmd)
                 .split_whitespace()
                 .map(String::from)
                 .collect(),
+            auto_approve: settings.agent_mode == "full",
             silence_ms: env("VA_SILENCE_MS", &settings.silence_ms.to_string())
                 .parse()
                 .unwrap_or(1000.0),
@@ -141,6 +145,7 @@ fn main() -> Result<()> {
         Some("test-wake") => test_wake(&cfg),
         Some("test-vad") => test_vad(&cfg),
         Some("test-asr") => test_asr(&cfg),
+        Some("ask") => ask_cli(&cfg),
         Some(other) => {
             eprintln!("unknown command: {other}");
             std::process::exit(2);
@@ -155,6 +160,21 @@ fn start_capture() -> Result<(audio::Capture, Receiver<Vec<i16>>)> {
     Ok((cap, rx))
 }
 
+/// Headless ACP check (no mic): spawn the agent once and send each argument as
+/// a prompt in the SAME session, so multiple prompts prove session continuity.
+///   voice-assistant ask "remember 42" "what number did I say?"
+fn ask_cli(cfg: &Config) -> Result<()> {
+    let prompts: Vec<String> = std::env::args().skip(2).collect();
+    anyhow::ensure!(!prompts.is_empty(), "usage: voice-assistant ask <text> [more text...]");
+    eprintln!("[acp] starting agent: {}", cfg.agent_cmd.join(" "));
+    let mut client = acp::AcpClient::spawn(&cfg.agent_cmd, cfg.auto_approve)?;
+    for (i, p) in prompts.iter().enumerate() {
+        println!("\n>> [{}] {p}", i + 1);
+        client.prompt(p)?;
+    }
+    Ok(())
+}
+
 // ---------------- full pipeline ----------------
 
 fn run(cfg: &Config) -> Result<()> {
@@ -162,6 +182,11 @@ fn run(cfg: &Config) -> Result<()> {
     let mut vad = cfg.vad()?;
     let asr = cfg.asr()?;
     let (_cap, rx) = start_capture()?;
+
+    // Launch the agent ONCE and keep it alive: no per-turn cold start, and the
+    // conversation keeps its context across wake cycles (session continuity).
+    eprintln!("[acp] starting agent: {}", cfg.agent_cmd.join(" "));
+    let mut client = acp::AcpClient::spawn(&cfg.agent_cmd, cfg.auto_approve)?;
 
     println!(
         "== voice assistant ready, say the wake word (\"{}\") ==",
@@ -189,9 +214,17 @@ fn run(cfg: &Config) -> Result<()> {
             Ok(text) if text.is_empty() => println!(">> heard nothing, back to listening"),
             Ok(text) => {
                 println!(">> you said: {text}");
-                println!(">> asking kiro-cli...\n");
-                agent::ask_kiro(&text, &cfg.kiro_args)?;
-                println!();
+                println!(">> asking agent...\n");
+                // A dead/broken agent process shouldn't kill the assistant:
+                // report, respawn a fresh session, and retry once.
+                if let Err(e) = client.prompt(&text) {
+                    eprintln!("\n>> agent prompt failed: {e}; restarting agent...");
+                    if let Err(e) = client.respawn() {
+                        eprintln!(">> failed to restart agent: {e}");
+                    } else if let Err(e) = client.prompt(&text) {
+                        eprintln!(">> retry after restart failed: {e}");
+                    }
+                }
             }
             Err(e) => eprintln!(">> transcription failed: {e}"),
         }

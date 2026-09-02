@@ -42,7 +42,9 @@ pub struct Settings {
     /// Whisper model size (base/small/medium).
     pub whisper: String,
     pub threshold: f32,
-    pub kiro_args: String,
+    /// Full command used to launch the ACP agent process. Agent-agnostic:
+    /// point this at any ACP-speaking backend. Default: kiro-cli acp --agent voice.
+    pub agent_cmd: String,
     /// kiro-cli agent permission mode: readonly / safe / full.
     pub agent_mode: String,
     /// End the utterance after this much trailing silence.
@@ -60,7 +62,7 @@ impl Default for Settings {
             lang: "auto".into(),
             whisper: "base".into(),
             threshold: 0.5,
-            kiro_args: String::new(),
+            agent_cmd: "kiro-cli acp --agent voice".into(),
             agent_mode: "readonly".into(),
             silence_ms: 1000,
             no_speech_ms: 6000,
@@ -97,7 +99,7 @@ pub fn load() -> Option<Settings> {
             "lang" => s.lang = v.into(),
             "whisper" => s.whisper = v.into(),
             "threshold" => s.threshold = v.parse().unwrap_or(0.5),
-            "kiro_args" => s.kiro_args = v.into(),
+            "agent_cmd" => s.agent_cmd = v.into(),
             "agent_mode" => s.agent_mode = v.into(),
             "silence_ms" => s.silence_ms = v.parse().unwrap_or(1000),
             "no_speech_ms" => s.no_speech_ms = v.parse().unwrap_or(6000),
@@ -113,13 +115,13 @@ pub fn save(s: &Settings) -> Result<()> {
     fs::write(
         config_path(),
         format!(
-            "wake_word={}\nlang={}\nwhisper={}\nthreshold={}\nkiro_args={}\n\
+            "wake_word={}\nlang={}\nwhisper={}\nthreshold={}\nagent_cmd={}\n\
              agent_mode={}\nsilence_ms={}\nno_speech_ms={}\nmax_utterance_ms={}\n",
             s.wake_word,
             s.lang,
             s.whisper,
             s.threshold,
-            s.kiro_args,
+            s.agent_cmd,
             s.agent_mode,
             s.silence_ms,
             s.no_speech_ms,
@@ -202,12 +204,18 @@ pub fn interactive_setup(existing: Option<Settings>) -> Result<Settings> {
         _ => mchoice,
     };
 
-    // Generate the managed kiro-cli agent and route calls through it.
+    // Generate the managed kiro-cli agent and route calls through it over ACP.
     write_agent_config(&agent_mode)?;
-    let kiro_args = if cur.kiro_args.is_empty() {
-        "--agent voice".to_string()
+    // Launch command for the persistent ACP agent. "full" mode adds -a so the
+    // agent auto-approves tool use (voice can't do interactive confirmations).
+    let agent_cmd = if cur.agent_cmd.is_empty() || cur.agent_cmd.starts_with("kiro-cli") {
+        let mut c = "kiro-cli acp --agent voice".to_string();
+        if agent_mode == "full" {
+            c.push_str(" -a");
+        }
+        c
     } else {
-        cur.kiro_args
+        cur.agent_cmd // user configured a custom (non-kiro) ACP backend; keep it
     };
 
     let settings = Settings {
@@ -215,7 +223,7 @@ pub fn interactive_setup(existing: Option<Settings>) -> Result<Settings> {
         lang,
         whisper,
         threshold: cur.threshold,
-        kiro_args,
+        agent_cmd,
         agent_mode,
         silence_ms: cur.silence_ms,
         no_speech_ms: cur.no_speech_ms,
