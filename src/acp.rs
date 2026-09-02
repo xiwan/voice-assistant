@@ -13,17 +13,34 @@
 //! Flow (validated in scratch/try_acp.py against kiro-cli 2.21.0):
 //!   initialize -> session/new -> session/prompt (repeat per turn)
 //! Assistant text arrives as `session/update` notifications carrying
-//! `agent_message_chunk` content; the prompt request resolves with a
-//! `stopReason` when the turn ends. Agent-specific notifications (kiro uses
-//! the `_kiro.dev/*` namespace) are ignored.
+//! `agent_message_chunk` content; `agent_thought_chunk`, `tool_call` and
+//! `tool_call_update` are surfaced as dimmed progress lines so a turn that
+//! spends time in tools doesn't look like a hang. The prompt request resolves
+//! with a `stopReason` when the turn ends. Agent-specific notifications (kiro
+//! uses the `_kiro.dev/*` namespace) are ignored.
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, IsTerminal, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 /// Protocol version we speak. ACP is currently at 1.
 const PROTOCOL_VERSION: i64 = 1;
+
+/// Longest tool title / thought line we echo, so progress stays one line.
+const MAX_STATUS_CHARS: usize = 96;
+
+/// What the agent was last streaming, so we can insert separators only when the
+/// output actually switches between reply text, thinking, and tool progress.
+#[derive(PartialEq)]
+enum Stream {
+    /// Nothing streamed yet, or the last thing printed ended with a newline.
+    Idle,
+    /// Mid-line inside the assistant's reply text.
+    Message,
+    /// Mid-line inside the agent's thinking text.
+    Thought,
+}
 
 pub struct AcpClient {
     /// The launch command (argv), kept so we can respawn on failure.
@@ -34,6 +51,10 @@ pub struct AcpClient {
     reader: BufReader<ChildStdout>,
     next_id: i64,
     session_id: String,
+    /// Tracks what is currently being streamed (see `Stream`).
+    stream: Stream,
+    /// Dim the progress lines only when stdout is a real terminal.
+    color: bool,
 }
 
 impl AcpClient {
@@ -54,6 +75,8 @@ impl AcpClient {
             reader,
             next_id: 1,
             session_id: String::new(),
+            stream: Stream::Idle,
+            color: std::io::stdout().is_terminal(),
         };
         c.handshake()?;
         Ok(c)
@@ -70,6 +93,7 @@ impl AcpClient {
         self.reader = reader;
         self.next_id = 1;
         self.session_id.clear();
+        self.stream = Stream::Idle;
         self.handshake()
     }
 
@@ -113,10 +137,18 @@ impl AcpClient {
         Ok(())
     }
 
-    /// Send one prompt turn and stream the assistant's reply to stdout.
+    /// Send one prompt turn and stream the assistant's reply to stdout, along
+    /// with progress lines for thinking and tool calls (so a long turn never
+    /// looks like a hang).
     /// Returns when the agent finishes the turn (`stopReason`).
     pub fn prompt(&mut self, text: &str) -> Result<()> {
         let session_id = self.session_id.clone();
+        self.stream = Stream::Idle;
+        // Immediate feedback: a turn can spend seconds thinking before the
+        // first token (kiro doesn't stream thoughts by default), and tool
+        // progress only appears once a tool starts. Without this the terminal
+        // looks frozen right after the prompt.
+        self.status("  · 思考中…");
         self.request(
             "session/prompt",
             json!({
@@ -124,6 +156,10 @@ impl AcpClient {
                 "prompt": [{ "type": "text", "text": text }],
             }),
         )?;
+        if self.stream != Stream::Idle {
+            println!();
+        }
+        self.stream = Stream::Idle;
         println!();
         Ok(())
     }
@@ -193,20 +229,82 @@ impl AcpClient {
         }
     }
 
-    fn handle_notification(&self, method: &str, msg: &Value) {
-        // We only care about streamed assistant text. Everything else
-        // (agent-specific `_kiro.dev/*` notifications, plan updates, tool
-        // call chatter) is ignored so the client stays agent-agnostic.
+    fn handle_notification(&mut self, method: &str, msg: &Value) {
+        // Standard ACP updates only. Agent-specific namespaces (kiro's
+        // `_kiro.dev/*`, e.g. tool_call_chunk / metadata) are ignored: the
+        // standard `tool_call` notification carries the same information.
         if method != "session/update" {
             return;
         }
         let update = &msg["params"]["update"];
-        if update.get("sessionUpdate").and_then(Value::as_str) == Some("agent_message_chunk") {
-            if let Some(text) = update["content"]["text"].as_str() {
-                print!("{text}");
-                let _ = std::io::stdout().flush();
+        let kind = update.get("sessionUpdate").and_then(Value::as_str).unwrap_or("");
+        match kind {
+            // The reply itself.
+            "agent_message_chunk" => {
+                if let Some(text) = update["content"]["text"].as_str() {
+                    self.enter(Stream::Message, "");
+                    self.out(text);
+                }
             }
+            // Reasoning, when the model exposes it. Dimmed and prefixed so it
+            // is clearly not part of the answer.
+            "agent_thought_chunk" => {
+                if let Some(text) = update["content"]["text"].as_str() {
+                    self.enter(Stream::Thought, "  · 思考: ");
+                    self.out(text);
+                }
+            }
+            // A tool is starting: this is where the old client went silent.
+            "tool_call" => {
+                let title = update.get("title").and_then(Value::as_str).unwrap_or("tool");
+                self.status(&format!("  · {}...", truncate(title)));
+            }
+            // Tool finished (or failed). `in_progress` updates are skipped to
+            // avoid one line per chunk of tool output.
+            "tool_call_update" => {
+                let status = update.get("status").and_then(Value::as_str).unwrap_or("");
+                let title = update.get("title").and_then(Value::as_str).unwrap_or("tool");
+                match status {
+                    "completed" => self.status(&format!("  ✓ {}", truncate(title))),
+                    "failed" => self.status(&format!("  ✗ {} 失败", truncate(title))),
+                    _ => {}
+                }
+            }
+            _ => {}
         }
+    }
+
+    /// Switch the output stream, emitting a newline + `lead` label when the
+    /// kind of content changes (so reply text and thoughts never run together).
+    fn enter(&mut self, next: Stream, lead: &str) {
+        if self.stream == next {
+            return;
+        }
+        if self.stream != Stream::Idle {
+            self.out("\n");
+        }
+        self.stream = next;
+        if !lead.is_empty() {
+            self.out(lead);
+        }
+    }
+
+    /// Print a one-off progress line (tool activity), on its own line.
+    fn status(&mut self, line: &str) {
+        if self.stream != Stream::Idle {
+            self.out("\n");
+            self.stream = Stream::Idle;
+        }
+        if self.color {
+            self.out(&format!("\x1b[2m{line}\x1b[0m\n"));
+        } else {
+            self.out(&format!("{line}\n"));
+        }
+    }
+
+    fn out(&self, s: &str) {
+        print!("{s}");
+        let _ = std::io::stdout().flush();
     }
 
     /// Respond to an agent-initiated request. The only one we expect is
@@ -215,6 +313,10 @@ impl AcpClient {
         let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
         let result = if method == "session/request_permission" {
             let options = msg["params"]["options"].as_array().cloned().unwrap_or_default();
+            let tool = msg["params"]["toolCall"]["title"]
+                .as_str()
+                .unwrap_or("工具")
+                .to_string();
             // Prefer an allow/reject option matching our policy; fall back to
             // cancelling the request if we can't find a suitable option.
             let want = if self.auto_approve { "allow" } else { "reject" };
@@ -226,6 +328,10 @@ impl AcpClient {
                     None
                 }
             });
+            // Make the decision visible: a silent rejection otherwise looks
+            // like the agent simply refused for no reason.
+            let verdict = if self.auto_approve { "已批准" } else { "已拒绝（权限模式）" };
+            self.status(&format!("  · {} 请求授权 → {verdict}", truncate(&tool)));
             match picked {
                 Some(opt) => json!({ "outcome": { "outcome": "selected", "optionId": opt } }),
                 None => json!({ "outcome": { "outcome": "cancelled" } }),
@@ -234,6 +340,40 @@ impl AcpClient {
             Value::Null
         };
         let _ = self.send(&json!({ "jsonrpc": "2.0", "id": id, "result": result }));
+    }
+}
+
+/// Clip a status line to `MAX_STATUS_CHARS` characters (char-wise, so multi-byte
+/// titles are never split mid-character) and flatten embedded newlines.
+fn truncate(s: &str) -> String {
+    let flat = s.replace(['\n', '\r'], " ");
+    if flat.chars().count() <= MAX_STATUS_CHARS {
+        return flat;
+    }
+    flat.chars().take(MAX_STATUS_CHARS).collect::<String>() + "…"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{truncate, MAX_STATUS_CHARS};
+
+    #[test]
+    fn flattens_newlines() {
+        assert_eq!(truncate("read\nfile"), "read file");
+    }
+
+    #[test]
+    fn short_titles_pass_through() {
+        assert_eq!(truncate("读取目录"), "读取目录");
+    }
+
+    #[test]
+    fn clips_on_char_boundaries() {
+        // Byte-wise slicing would panic here; char-wise must not.
+        let long = "读".repeat(MAX_STATUS_CHARS + 20);
+        let out = truncate(&long);
+        assert_eq!(out.chars().count(), MAX_STATUS_CHARS + 1); // + the ellipsis
+        assert!(out.ends_with('…'));
     }
 }
 

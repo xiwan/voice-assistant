@@ -29,7 +29,6 @@ mod wakeword;
 
 use anyhow::Result;
 use crossbeam_channel::Receiver;
-use std::collections::VecDeque;
 use std::io::IsTerminal;
 use std::time::Duration;
 use vad::VAD_CHUNK;
@@ -215,15 +214,10 @@ fn run(cfg: &Config) -> Result<()> {
         "== voice assistant ready, say the wake word (\"{}\") ==",
         cfg.wake_display
     );
-    let mut preroll: VecDeque<i16> = VecDeque::new(); // ~0.5s of pre-wake audio
 
     loop {
         // ---- wait for the wake word ----
         let chunk = rx.recv()?;
-        preroll.extend(chunk.iter().copied());
-        while preroll.len() > 8000 {
-            preroll.pop_front();
-        }
         let Some(score) = wake.feed(&chunk)? else {
             continue;
         };
@@ -239,7 +233,7 @@ fn run(cfg: &Config) -> Result<()> {
         loop {
             while rx.try_recv().is_ok() {} // drop audio buffered during reply/ASR
             vad.reset();
-            let audio = match record_utterance(&rx, &mut vad, Vec::new(), cfg)? {
+            let audio = match record_utterance(&rx, &mut vad, cfg)? {
                 Some(a) => a,
                 None => {
                     println!(">> {}: 好的，我先下线待机了，需要时再叫我。", cfg.persona);
@@ -272,7 +266,6 @@ fn run(cfg: &Config) -> Result<()> {
         }
 
         wake.reset();
-        preroll.clear();
         println!("== listening for wake word ==");
     }
 }
@@ -283,30 +276,43 @@ fn run(cfg: &Config) -> Result<()> {
 fn record_utterance(
     rx: &Receiver<Vec<i16>>,
     vad: &mut vad::Vad,
-    preroll: Vec<i16>,
     cfg: &Config,
 ) -> Result<Option<Vec<i16>>> {
     const CHUNK_MS: f32 = VAD_CHUNK as f32 * 1000.0 / 16000.0; // 32 ms
-    let mut audio = preroll;
+    const STALL_MS: f32 = 500.0; // wait this long before assuming silence
+    let mut audio: Vec<i16> = Vec::new();
     let mut pending: Vec<i16> = Vec::new();
     let mut speech_started = false;
     let mut silence_ms = 0f32;
     let mut total_ms = 0f32;
 
     loop {
-        let chunk = rx.recv_timeout(Duration::from_secs(2))?;
-        audio.extend_from_slice(&chunk);
-        pending.extend_from_slice(&chunk);
-        while pending.len() >= VAD_CHUNK {
-            let frame: Vec<i16> = pending.drain(..VAD_CHUNK).collect();
-            let p = vad.predict(&frame)?;
-            if p > 0.5 {
-                speech_started = true;
-                silence_ms = 0.0;
-            } else {
-                silence_ms += CHUNK_MS;
+        match rx.recv_timeout(Duration::from_millis(STALL_MS as u64)) {
+            Ok(chunk) => {
+                audio.extend_from_slice(&chunk);
+                pending.extend_from_slice(&chunk);
+                while pending.len() >= VAD_CHUNK {
+                    let frame: Vec<i16> = pending.drain(..VAD_CHUNK).collect();
+                    let p = vad.predict(&frame)?;
+                    if p > 0.5 {
+                        speech_started = true;
+                        silence_ms = 0.0;
+                    } else {
+                        silence_ms += CHUNK_MS;
+                    }
+                    total_ms += CHUNK_MS;
+                }
             }
-            total_ms += CHUNK_MS;
+            // No audio arrived in time (device switch, system hiccup). Count it
+            // as silence and let the normal timeouts end the turn: a momentary
+            // stall must not take down the whole assistant.
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                silence_ms += STALL_MS;
+                total_ms += STALL_MS;
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                anyhow::bail!("audio capture stopped (input device gone?)")
+            }
         }
         if speech_started && silence_ms >= cfg.silence_ms {
             break; // said something, then went quiet -> done
@@ -430,7 +436,7 @@ fn test_asr(cfg: &Config) -> Result<()> {
     let asr = cfg.asr()?;
     let (_cap, rx) = start_capture()?;
     println!("speak now (recording until 1s of silence)...");
-    match record_utterance(&rx, &mut vad, Vec::new(), cfg)? {
+    match record_utterance(&rx, &mut vad, cfg)? {
         Some(audio) => {
             println!("recorded {:.1}s, transcribing...", audio.len() as f32 / 16000.0);
             let text = asr.transcribe(&audio)?;
