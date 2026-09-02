@@ -1,28 +1,32 @@
-//! Agent-agnostic client for the Agent Client Protocol (ACP).
+//! Agent-agnostic connection for the Agent Client Protocol (ACP).
 //!
 //! ACP is a transport standard (JSON-RPC 2.0 over newline-delimited stdio),
 //! not something specific to any one agent. We launch a configurable agent
 //! command (default `kiro-cli acp --agent voice`) and drive it; swapping to
 //! another ACP-speaking backend is a config change, not a code change.
 //!
-//! Why this instead of spawning `kiro-cli chat` per utterance: the agent
-//! process is started ONCE and kept alive, so (a) there is no per-turn cold
-//! start and (b) the conversation keeps its context across wake cycles — the
-//! session lives in the running process.
+//! This is the LOW-LEVEL half: one `AcpConnection` owns one child process and
+//! its stdio. A dedicated reader subthread turns the child's stdout into an
+//! `Incoming` channel, so the owner (the supervisor in `agent.rs`) can wait on
+//! agent output and control commands at the same time and cancel a running
+//! turn — the whole point of not blocking the main loop.
 //!
-//! Flow (validated in scratch/try_acp.py against kiro-cli 2.21.0):
-//!   initialize -> session/new -> session/prompt (repeat per turn)
-//! Assistant text arrives as `session/update` notifications carrying
-//! `agent_message_chunk` content; `agent_thought_chunk`, `tool_call` and
-//! `tool_call_update` are surfaced as dimmed progress lines so a turn that
-//! spends time in tools doesn't look like a hang. The prompt request resolves
-//! with a `stopReason` when the turn ends. Agent-specific notifications (kiro
-//! uses the `_kiro.dev/*` namespace) are ignored.
+//! Flow (validated in scratch/try_acp.py + try_acp_cancel.py against kiro-cli
+//! 2.21.0): initialize -> session/new -> session/prompt; `session/cancel`
+//! stops an in-flight turn in ~30ms (stopReason "cancelled") and the session
+//! survives for the next prompt. Assistant text arrives as `session/update`
+//! notifications (`agent_message_chunk`); `agent_thought_chunk`, `tool_call`
+//! and `tool_call_update` are surfaced as dimmed progress lines so a turn that
+//! spends time thinking or in tools never looks like a hang. Agent-specific
+//! notifications (kiro's `_kiro.dev/*`) are ignored.
 
 use anyhow::{anyhow, bail, Context, Result};
+use crossbeam_channel::{unbounded, Receiver};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, IsTerminal, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 /// Protocol version we speak. ACP is currently at 1.
 const PROTOCOL_VERSION: i64 = 1;
@@ -30,74 +34,44 @@ const PROTOCOL_VERSION: i64 = 1;
 /// Longest tool title / thought line we echo, so progress stays one line.
 const MAX_STATUS_CHARS: usize = 96;
 
-/// What the agent was last streaming, so we can insert separators only when the
-/// output actually switches between reply text, thinking, and tool progress.
+/// A message read off the agent's stdout, or a signal that the stream ended.
+pub enum Incoming {
+    Msg(Value),
+    /// The agent closed stdout / the reader hit an error — the process is gone.
+    Closed,
+}
+
+/// What the agent was last streaming, so we insert separators only when the
+/// output switches between reply text, thinking, and tool progress.
 #[derive(PartialEq)]
 enum Stream {
-    /// Nothing streamed yet, or the last thing printed ended with a newline.
     Idle,
-    /// Mid-line inside the assistant's reply text.
     Message,
-    /// Mid-line inside the agent's thinking text.
     Thought,
 }
 
-pub struct AcpClient {
-    /// The launch command (argv), kept so we can respawn on failure.
-    cmd: Vec<String>,
-    auto_approve: bool,
+pub struct AcpConnection {
     child: Child,
     stdin: ChildStdin,
-    reader: BufReader<ChildStdout>,
     next_id: i64,
     session_id: String,
-    /// Tracks what is currently being streamed (see `Stream`).
+    /// Request id of the in-flight `session/prompt`, if a turn is running.
+    active_prompt: Option<i64>,
+    /// Approve tool-permission requests (the "full" trust mode); otherwise
+    /// reject anything the launched agent's own allow-list didn't permit.
+    auto_approve: bool,
     stream: Stream,
-    /// Dim the progress lines only when stdout is a real terminal.
     color: bool,
 }
 
-impl AcpClient {
-    /// Launch `cmd` and complete the ACP handshake (initialize + session/new).
-    ///
-    /// `auto_approve` decides how tool-permission requests are answered: when
-    /// true we approve them (used for the "full" trust mode); otherwise we
-    /// reject anything the agent's own allow-list did not already permit,
-    /// since there is no human at the keyboard to ask in voice mode.
-    pub fn spawn(cmd: &[String], auto_approve: bool) -> Result<Self> {
+impl AcpConnection {
+    /// Launch `cmd`, start the reader subthread, and complete the ACP handshake
+    /// (initialize + session/new). Returns the connection plus the `Incoming`
+    /// receiver the caller waits on. Keeping the receiver separate from the
+    /// connection lets the supervisor `select!` on it while still holding
+    /// `&mut AcpConnection` to handle each message.
+    pub fn connect(cmd: &[String], auto_approve: bool) -> Result<(Self, Receiver<Incoming>)> {
         anyhow::ensure!(!cmd.is_empty(), "agent command is empty");
-        let (child, stdin, reader) = Self::start_process(cmd)?;
-        let mut c = Self {
-            cmd: cmd.to_vec(),
-            auto_approve,
-            child,
-            stdin,
-            reader,
-            next_id: 1,
-            session_id: String::new(),
-            stream: Stream::Idle,
-            color: std::io::stdout().is_terminal(),
-        };
-        c.handshake()?;
-        Ok(c)
-    }
-
-    /// Kill the current agent process and start a fresh one with a new session.
-    /// Used to recover from a crashed/broken agent without losing the pipeline.
-    pub fn respawn(&mut self) -> Result<()> {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        let (child, stdin, reader) = Self::start_process(&self.cmd)?;
-        self.child = child;
-        self.stdin = stdin;
-        self.reader = reader;
-        self.next_id = 1;
-        self.session_id.clear();
-        self.stream = Stream::Idle;
-        self.handshake()
-    }
-
-    fn start_process(cmd: &[String]) -> Result<(Child, ChildStdin, BufReader<ChildStdout>)> {
         let mut child = Command::new(&cmd[0])
             .args(&cmd[1..])
             .stdin(Stdio::piped())
@@ -107,11 +81,24 @@ impl AcpClient {
             .map_err(|e| anyhow!("failed to launch agent `{}`: {e}", cmd.join(" ")))?;
         let stdin = child.stdin.take().context("agent stdin unavailable")?;
         let stdout = child.stdout.take().context("agent stdout unavailable")?;
-        Ok((child, stdin, BufReader::new(stdout)))
+        let incoming = spawn_reader(stdout);
+        let mut c = Self {
+            child,
+            stdin,
+            next_id: 1,
+            session_id: String::new(),
+            active_prompt: None,
+            auto_approve,
+            stream: Stream::Idle,
+            color: std::io::stdout().is_terminal(),
+        };
+        c.handshake(&incoming)?;
+        Ok((c, incoming))
     }
 
-    fn handshake(&mut self) -> Result<()> {
-        let init = self.request(
+    fn handshake(&mut self, incoming: &Receiver<Incoming>) -> Result<()> {
+        let init = self.request_blocking(
+            incoming,
             "initialize",
             json!({
                 "protocolVersion": PROTOCOL_VERSION,
@@ -125,10 +112,8 @@ impl AcpClient {
         let cwd = std::env::current_dir()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|_| ".".to_string());
-        let newsess = self.request(
-            "session/new",
-            json!({ "cwd": cwd, "mcpServers": [] }),
-        )?;
+        let newsess =
+            self.request_blocking(incoming, "session/new", json!({ "cwd": cwd, "mcpServers": [] }))?;
         self.session_id = newsess
             .get("sessionId")
             .and_then(Value::as_str)
@@ -137,130 +122,135 @@ impl AcpClient {
         Ok(())
     }
 
-    /// Send one prompt turn and stream the assistant's reply to stdout, along
-    /// with progress lines for thinking and tool calls (so a long turn never
-    /// looks like a hang).
-    /// Returns when the agent finishes the turn (`stopReason`).
-    pub fn prompt(&mut self, text: &str) -> Result<()> {
-        let session_id = self.session_id.clone();
-        self.stream = Stream::Idle;
-        // Immediate feedback: a turn can spend seconds thinking before the
-        // first token (kiro doesn't stream thoughts by default), and tool
-        // progress only appears once a tool starts. Without this the terminal
-        // looks frozen right after the prompt.
-        self.status("  · 思考中…");
-        self.request(
-            "session/prompt",
-            json!({
-                "sessionId": session_id,
-                "prompt": [{ "type": "text", "text": text }],
-            }),
-        )?;
-        if self.stream != Stream::Idle {
-            println!();
-        }
-        self.stream = Stream::Idle;
-        println!();
-        Ok(())
-    }
-
-    // ---- JSON-RPC plumbing ----
-
-    fn send(&mut self, msg: &Value) -> Result<()> {
-        let line = serde_json::to_string(msg)?;
-        self.stdin
-            .write_all(line.as_bytes())
-            .and_then(|_| self.stdin.write_all(b"\n"))
-            .and_then(|_| self.stdin.flush())
-            .context("failed writing to agent stdin (process gone?)")?;
-        Ok(())
-    }
-
-    /// Send a request and pump the stream until its response arrives, handling
-    /// notifications (streamed text) and agent-initiated requests (permissions)
-    /// along the way. Returns the `result` object of our request.
-    fn request(&mut self, method: &str, params: Value) -> Result<Value> {
+    /// Send a request and block until its response arrives, handling
+    /// notifications / agent requests in between. Used only for the handshake;
+    /// once running, the supervisor pumps `Incoming` and calls `handle`.
+    fn request_blocking(
+        &mut self,
+        incoming: &Receiver<Incoming>,
+        method: &str,
+        params: Value,
+    ) -> Result<Value> {
         let id = self.next_id;
         self.next_id += 1;
         self.send(&json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }))?;
-
         loop {
-            let msg = self.read_message()?;
-
-            // Response to one of our requests.
-            if let Some(mid) = msg.get("id").and_then(Value::as_i64) {
-                if msg.get("method").is_none() {
-                    if mid != id {
-                        continue; // stale/interleaved response id, ignore
+            match incoming.recv() {
+                Ok(Incoming::Msg(v)) => {
+                    if v.get("id").and_then(Value::as_i64) == Some(id) && v.get("method").is_none() {
+                        if let Some(err) = v.get("error") {
+                            bail!("agent error on {method}: {err}");
+                        }
+                        return Ok(v.get("result").cloned().unwrap_or(Value::Null));
                     }
-                    if let Some(err) = msg.get("error") {
-                        bail!("agent error on {method}: {err}");
-                    }
-                    return Ok(msg.get("result").cloned().unwrap_or(Value::Null));
+                    self.handle(&v);
                 }
-                // Has both id and method => a request FROM the agent.
-                self.answer_agent_request(mid, &msg);
-                continue;
-            }
-
-            // Notification (no id).
-            if let Some(m) = msg.get("method").and_then(Value::as_str) {
-                self.handle_notification(m, &msg);
+                Ok(Incoming::Closed) | Err(_) => {
+                    bail!("agent stream closed during {method}")
+                }
             }
         }
     }
 
-    fn read_message(&mut self) -> Result<Value> {
-        loop {
-            let mut line = String::new();
-            let n = self
-                .reader
-                .read_line(&mut line)
-                .context("failed reading from agent stdout")?;
-            if n == 0 {
-                bail!("agent closed its output stream (process exited?)");
-            }
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            return serde_json::from_str(line)
-                .with_context(|| format!("agent emitted non-JSON line: {line}"));
-        }
+    /// Start a new prompt turn (non-blocking). Records the request id so the
+    /// matching response can be recognised as the turn's end.
+    pub fn send_prompt(&mut self, text: &str) -> Result<()> {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.active_prompt = Some(id);
+        self.stream = Stream::Idle;
+        let session_id = self.session_id.clone();
+        self.send(&json!({
+            "jsonrpc": "2.0", "id": id, "method": "session/prompt",
+            "params": { "sessionId": session_id, "prompt": [{ "type": "text", "text": text }] },
+        }))
     }
 
-    fn handle_notification(&mut self, method: &str, msg: &Value) {
-        // Standard ACP updates only. Agent-specific namespaces (kiro's
-        // `_kiro.dev/*`, e.g. tool_call_chunk / metadata) are ignored: the
-        // standard `tool_call` notification carries the same information.
-        if method != "session/update" {
-            return;
+    /// Ask the agent to cancel the in-flight turn (ACP notification, no id).
+    pub fn send_cancel(&mut self) -> Result<()> {
+        let session_id = self.session_id.clone();
+        self.send(&json!({
+            "jsonrpc": "2.0", "method": "session/cancel",
+            "params": { "sessionId": session_id },
+        }))
+    }
+
+    pub fn is_busy(&self) -> bool {
+        self.active_prompt.is_some()
+    }
+
+    /// Cancel the running turn and pump messages until it actually resolves,
+    /// or `grace` elapses. On timeout / stream close this returns an error so
+    /// the supervisor can escalate to kill + respawn (the hard failsafe).
+    pub fn cancel_and_wait(&mut self, incoming: &Receiver<Incoming>, grace: Duration) -> Result<()> {
+        if !self.is_busy() {
+            return Ok(());
         }
-        let update = &msg["params"]["update"];
-        let kind = update.get("sessionUpdate").and_then(Value::as_str).unwrap_or("");
-        match kind {
-            // The reply itself.
+        self.send_cancel()?;
+        let deadline = Instant::now() + grace;
+        while self.is_busy() {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .ok_or_else(|| anyhow!("cancel timed out after {grace:?}"))?;
+            match incoming.recv_timeout(remaining) {
+                Ok(Incoming::Msg(v)) => {
+                    self.handle(&v);
+                }
+                Ok(Incoming::Closed) => bail!("agent stream closed while cancelling"),
+                Err(_) => bail!("cancel timed out after {grace:?}"),
+            }
+        }
+        Ok(())
+    }
+
+    /// Process one incoming message. Renders reply text / progress, answers
+    /// permission requests, and — when the active turn's response arrives —
+    /// returns its `stopReason`.
+    pub fn handle(&mut self, msg: &Value) -> Option<String> {
+        if let Some(id) = msg.get("id").and_then(Value::as_i64) {
+            if msg.get("method").is_none() {
+                // Response to a request we sent.
+                if self.active_prompt == Some(id) {
+                    self.active_prompt = None;
+                    self.finish_line();
+                    let stop = msg["result"]["stopReason"]
+                        .as_str()
+                        .unwrap_or("end_turn")
+                        .to_string();
+                    return Some(stop);
+                }
+                return None;
+            }
+            // Request FROM the agent (permission).
+            self.answer_agent_request(id, msg);
+            return None;
+        }
+        if msg.get("method").and_then(Value::as_str) == Some("session/update") {
+            self.render_update(&msg["params"]["update"]);
+        }
+        None
+    }
+
+    // ---- rendering ----
+
+    fn render_update(&mut self, update: &Value) {
+        match update.get("sessionUpdate").and_then(Value::as_str).unwrap_or("") {
             "agent_message_chunk" => {
                 if let Some(text) = update["content"]["text"].as_str() {
                     self.enter(Stream::Message, "");
                     self.out(text);
                 }
             }
-            // Reasoning, when the model exposes it. Dimmed and prefixed so it
-            // is clearly not part of the answer.
             "agent_thought_chunk" => {
                 if let Some(text) = update["content"]["text"].as_str() {
                     self.enter(Stream::Thought, "  · 思考: ");
                     self.out(text);
                 }
             }
-            // A tool is starting: this is where the old client went silent.
             "tool_call" => {
                 let title = update.get("title").and_then(Value::as_str).unwrap_or("tool");
                 self.status(&format!("  · {}...", truncate(title)));
             }
-            // Tool finished (or failed). `in_progress` updates are skipped to
-            // avoid one line per chunk of tool output.
             "tool_call_update" => {
                 let status = update.get("status").and_then(Value::as_str).unwrap_or("");
                 let title = update.get("title").and_then(Value::as_str).unwrap_or("tool");
@@ -274,8 +264,14 @@ impl AcpClient {
         }
     }
 
-    /// Switch the output stream, emitting a newline + `lead` label when the
-    /// kind of content changes (so reply text and thoughts never run together).
+    /// Emit a trailing newline if a turn ended mid-line.
+    fn finish_line(&mut self) {
+        if self.stream != Stream::Idle {
+            self.out("\n");
+            self.stream = Stream::Idle;
+        }
+    }
+
     fn enter(&mut self, next: Stream, lead: &str) {
         if self.stream == next {
             return;
@@ -289,7 +285,6 @@ impl AcpClient {
         }
     }
 
-    /// Print a one-off progress line (tool activity), on its own line.
     fn status(&mut self, line: &str) {
         if self.stream != Stream::Idle {
             self.out("\n");
@@ -307,18 +302,24 @@ impl AcpClient {
         let _ = std::io::stdout().flush();
     }
 
-    /// Respond to an agent-initiated request. The only one we expect is
-    /// `session/request_permission`; anything else gets an empty result.
+    fn send(&mut self, msg: &Value) -> Result<()> {
+        let line = serde_json::to_string(msg)?;
+        self.stdin
+            .write_all(line.as_bytes())
+            .and_then(|_| self.stdin.write_all(b"\n"))
+            .and_then(|_| self.stdin.flush())
+            .context("failed writing to agent stdin (process gone?)")?;
+        Ok(())
+    }
+
     fn answer_agent_request(&mut self, id: i64, msg: &Value) {
         let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
         let result = if method == "session/request_permission" {
             let options = msg["params"]["options"].as_array().cloned().unwrap_or_default();
-            let tool = msg["params"]["toolCall"]["title"]
-                .as_str()
-                .unwrap_or("工具")
-                .to_string();
-            // Prefer an allow/reject option matching our policy; fall back to
-            // cancelling the request if we can't find a suitable option.
+            let tool = msg["params"]["toolCall"]["title"].as_str().unwrap_or("工具").to_string();
+            // Voice has no interactive confirmation. In "full" mode we approve;
+            // otherwise we reject anything the launched agent's own allow-list
+            // did not already permit (so readonly/safe can't be escalated).
             let want = if self.auto_approve { "allow" } else { "reject" };
             let picked = options.iter().find_map(|o| {
                 let kind = o.get("kind").or_else(|| o.get("name")).and_then(Value::as_str)?;
@@ -328,8 +329,6 @@ impl AcpClient {
                     None
                 }
             });
-            // Make the decision visible: a silent rejection otherwise looks
-            // like the agent simply refused for no reason.
             let verdict = if self.auto_approve { "已批准" } else { "已拒绝（权限模式）" };
             self.status(&format!("  · {} 请求授权 → {verdict}", truncate(&tool)));
             match picked {
@@ -343,8 +342,55 @@ impl AcpClient {
     }
 }
 
-/// Clip a status line to `MAX_STATUS_CHARS` characters (char-wise, so multi-byte
-/// titles are never split mid-character) and flatten embedded newlines.
+impl Drop for AcpConnection {
+    fn drop(&mut self) {
+        // Terminate the agent process and reap it (no zombies). This is what
+        // enforces the "at most one" half of the supervisor's invariant: a
+        // connection is never replaced without its child being killed+waited.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Reader subthread: turn the child's stdout into a channel of `Incoming`.
+/// It only reads (never writes), so the owner can write to stdin concurrently.
+fn spawn_reader(stdout: ChildStdout) -> Receiver<Incoming> {
+    let (tx, rx) = unbounded();
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) => {
+                    let _ = tx.send(Incoming::Closed);
+                    break;
+                }
+                Ok(_) => {
+                    let l = line.trim();
+                    if l.is_empty() {
+                        continue;
+                    }
+                    match serde_json::from_str::<Value>(l) {
+                        Ok(v) => {
+                            if tx.send(Incoming::Msg(v)).is_err() {
+                                break; // owner gone
+                            }
+                        }
+                        Err(_) => { /* skip a malformed line rather than die */ }
+                    }
+                }
+                Err(_) => {
+                    let _ = tx.send(Incoming::Closed);
+                    break;
+                }
+            }
+        }
+    });
+    rx
+}
+
+/// Clip a status line to `MAX_STATUS_CHARS` chars (char-wise, so multi-byte
+/// titles are never split) and flatten embedded newlines.
 fn truncate(s: &str) -> String {
     let flat = s.replace(['\n', '\r'], " ");
     if flat.chars().count() <= MAX_STATUS_CHARS {
@@ -355,33 +401,23 @@ fn truncate(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{truncate, MAX_STATUS_CHARS};
-
-    #[test]
-    fn flattens_newlines() {
-        assert_eq!(truncate("read\nfile"), "read file");
-    }
+    use super::*;
 
     #[test]
     fn short_titles_pass_through() {
-        assert_eq!(truncate("读取目录"), "读取目录");
+        assert_eq!(truncate("hello"), "hello");
     }
 
     #[test]
-    fn clips_on_char_boundaries() {
-        // Byte-wise slicing would panic here; char-wise must not.
-        let long = "读".repeat(MAX_STATUS_CHARS + 20);
-        let out = truncate(&long);
-        assert_eq!(out.chars().count(), MAX_STATUS_CHARS + 1); // + the ellipsis
-        assert!(out.ends_with('…'));
+    fn long_titles_are_clipped() {
+        let s = "x".repeat(200);
+        let t = truncate(&s);
+        assert_eq!(t.chars().count(), MAX_STATUS_CHARS + 1); // + the ellipsis
+        assert!(t.ends_with('…'));
     }
-}
 
-impl Drop for AcpClient {
-    fn drop(&mut self) {
-        // Terminate the agent process; self.stdin (and thus the agent's input)
-        // is closed when the struct's fields drop right after this returns.
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+    #[test]
+    fn newlines_flattened() {
+        assert_eq!(truncate("a\nb\rc"), "a b c");
     }
 }

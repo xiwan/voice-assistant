@@ -21,12 +21,14 @@
 //!   VA_HF_BASE         HuggingFace endpoint (default: https://hf-mirror.com)
 
 mod acp;
+mod agent;
 mod asr;
 mod audio;
 mod setup;
 mod vad;
 mod wakeword;
 
+use agent::{AgentHandle, AgentState};
 use anyhow::Result;
 use crossbeam_channel::Receiver;
 use std::io::IsTerminal;
@@ -151,6 +153,7 @@ fn main() -> Result<()> {
         Some("test-vad") => test_vad(&cfg),
         Some("test-asr") => test_asr(&cfg),
         Some("ask") => ask_cli(&cfg),
+        Some("agent-test") => agent_test(&cfg),
         Some(other) => {
             eprintln!("unknown command: {other}");
             std::process::exit(2);
@@ -176,19 +179,76 @@ fn sync_persona(cfg: &Config) {
     }
 }
 
-/// Headless ACP check (no mic): spawn the agent once and send each argument as
-/// a prompt in the SAME session, so multiple prompts prove session continuity.
+/// Keywords that mean "interrupt the current task" rather than "new request".
+fn is_cancel_intent(text: &str) -> bool {
+    const WORDS: &[&str] = &["停", "取消", "别说了", "停下", "闭嘴", "打断", "stop", "cancel"];
+    let t = text.to_lowercase();
+    WORDS.iter().any(|w| t.contains(w))
+}
+
+/// Block until the agent finishes the current turn (or dies), printing restarts.
+fn wait_for_idle(agent: &AgentHandle) {
+    for st in agent.state_rx.iter() {
+        match st {
+            AgentState::Idle(_) => return,
+            AgentState::Restarting(r) => eprintln!(">> agent 重启中: {r}"),
+            _ => {}
+        }
+    }
+}
+
+/// Headless ACP check (no mic): spawn the supervised agent and send each
+/// argument as a prompt in the SAME session, proving session continuity.
 ///   voice-assistant ask "remember 42" "what number did I say?"
 fn ask_cli(cfg: &Config) -> Result<()> {
     let prompts: Vec<String> = std::env::args().skip(2).collect();
     anyhow::ensure!(!prompts.is_empty(), "usage: voice-assistant ask <text> [more text...]");
     sync_persona(cfg);
     eprintln!("[acp] starting agent: {}", cfg.agent_cmd.join(" "));
-    let mut client = acp::AcpClient::spawn(&cfg.agent_cmd, cfg.auto_approve)?;
+    let agent = AgentHandle::spawn(cfg.agent_cmd.clone(), cfg.auto_approve);
     for (i, p) in prompts.iter().enumerate() {
         println!("\n>> [{}] {p}", i + 1);
-        client.prompt(p)?;
+        agent.prompt(p.clone());
+        wait_for_idle(&agent);
     }
+    agent.shutdown();
+    Ok(())
+}
+
+/// Hidden headless test of the supervisor: cancel an in-flight turn, then
+/// continue on the same session (proves redirect + session survival). With a
+/// bogus VA_AGENT_CMD it instead exercises the restart/backoff failsafe.
+fn agent_test(cfg: &Config) -> Result<()> {
+    sync_persona(cfg);
+    eprintln!("[agent-test] launching: {}", cfg.agent_cmd.join(" "));
+    let agent = AgentHandle::spawn(cfg.agent_cmd.clone(), cfg.auto_approve);
+
+    // Consume states until the next Idle, printing each transition. Returns the
+    // stopReason, or None if the agent channel closed.
+    let drain_to_idle = |label: &str| -> Option<String> {
+        for st in agent.state_rx.iter() {
+            println!(">> [{label}] state: {st:?}");
+            if let AgentState::Idle(reason) = st {
+                return Some(reason);
+            }
+        }
+        None
+    };
+
+    println!("\n>> [1] long task, will cancel after 1.2s");
+    agent.prompt("从1数到100，每个数字占一行，并加一句简短说明。".into());
+    std::thread::sleep(Duration::from_millis(1200));
+    println!("\n>> sending cancel");
+    agent.cancel();
+    let r1 = drain_to_idle("cancel");
+    println!(">> after cancel, stopReason = {r1:?} (expect \"cancelled\")");
+
+    println!("\n>> [2] continue on same session");
+    agent.prompt("刚才数到几了？一句话回答。".into());
+    let r2 = drain_to_idle("continue");
+    println!(">> after continue, stopReason = {r2:?} (expect \"end_turn\")");
+
+    agent.shutdown();
     Ok(())
 }
 
@@ -200,73 +260,103 @@ fn run(cfg: &Config) -> Result<()> {
     let asr = cfg.asr()?;
     let (_cap, rx) = start_capture()?;
 
-    // Keep the managed kiro agent's identity in sync with the wake word, so the
-    // connected agent introduces itself as e.g. "Jarvis" rather than "kiro".
-    // Only for the kiro backend; custom ACP agents manage their own persona.
+    // Keep the managed kiro agent's identity in sync with the wake word.
     sync_persona(cfg);
 
-    // Launch the agent ONCE and keep it alive: no per-turn cold start, and the
-    // conversation keeps its context across turns (session continuity).
+    // The agent runs under a supervisor thread: the main loop below never
+    // blocks on a reply, so it can always hear the wake word — including
+    // "Jarvis, 停" to interrupt a running task. Exactly one agent is kept alive.
     eprintln!("[acp] starting agent: {}", cfg.agent_cmd.join(" "));
-    let mut client = acp::AcpClient::spawn(&cfg.agent_cmd, cfg.auto_approve)?;
+    let agent = AgentHandle::spawn(cfg.agent_cmd.clone(), cfg.auto_approve);
 
     println!(
         "== voice assistant ready, say the wake word (\"{}\") ==",
         cfg.wake_display
     );
 
+    // `busy` tracks whether a turn is running; `followup` opens a no-wake
+    // listening window right after a turn ends (multi-turn without re-waking).
+    let mut busy = false;
+    let mut followup = false;
+
     loop {
-        // ---- wait for the wake word ----
-        let chunk = rx.recv()?;
-        let Some(score) = wake.feed(&chunk)? else {
-            continue;
-        };
-        if score < cfg.wake_threshold {
+        // Absorb agent state without blocking: a finished turn arms a follow-up
+        // window; a restart is announced.
+        for st in agent.state_rx.try_iter() {
+            match st {
+                AgentState::Busy => busy = true,
+                AgentState::Idle(reason) => {
+                    if reason == "cancelled" {
+                        println!(">> 已停止");
+                    } else if busy {
+                        followup = true; // open a no-wake window after a real reply
+                    }
+                    busy = false;
+                }
+                AgentState::Restarting(r) => {
+                    eprintln!(">> agent 重启中: {r}");
+                    busy = false;
+                }
+                AgentState::Ready => {}
+            }
+        }
+
+        if followup {
+            followup = false;
+            vad.reset();
+            match record_utterance(&rx, &mut vad, cfg)? {
+                Some(audio) => handle_command(audio, &asr, &agent, &mut busy),
+                None => println!(">> {}: 好的，我先下线待机了，需要时再叫我。", cfg.persona),
+            }
             continue;
         }
-        println!("\x07>> wake word detected (score {score:.2}), listening...");
 
-        // ---- conversation: first turn + follow-ups, no re-waking needed ----
-        // Each turn opens a listening window of `no_speech_ms`; if the user
-        // stays silent that long, the assistant announces standby and returns
-        // to wake-word mode. Otherwise the utterance continues the same session.
-        loop {
-            while rx.try_recv().is_ok() {} // drop audio buffered during reply/ASR
-            vad.reset();
-            let audio = match record_utterance(&rx, &mut vad, cfg)? {
-                Some(a) => a,
-                None => {
-                    println!(">> {}: 好的，我先下线待机了，需要时再叫我。", cfg.persona);
-                    break;
-                }
-            };
-            println!(">> transcribing {:.1}s of audio...", audio.len() as f32 / 16000.0);
-            match asr.transcribe(&audio) {
-                Ok(text) if text.is_empty() => {
-                    println!(">> 没听清，请再说一次");
+        // Wake-word gate. `recv_timeout` so we periodically re-check agent
+        // state instead of blocking forever on audio.
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(chunk) => {
+                let Some(score) = wake.feed(&chunk)? else {
+                    continue;
+                };
+                if score < cfg.wake_threshold {
                     continue;
                 }
-                Ok(text) => {
-                    println!(">> you said: {text}");
-                    println!(">> asking agent...\n");
-                    // A dead/broken agent process shouldn't kill the assistant:
-                    // report, respawn a fresh session, and retry once.
-                    if let Err(e) = client.prompt(&text) {
-                        eprintln!("\n>> agent prompt failed: {e}; restarting agent...");
-                        if let Err(e) = client.respawn() {
-                            eprintln!(">> failed to restart agent: {e}");
-                        } else if let Err(e) = client.prompt(&text) {
-                            eprintln!(">> retry after restart failed: {e}");
-                        }
-                    }
+                let hint = if busy { "，打断中" } else { "" };
+                println!("\x07>> wake word detected (score {score:.2}){hint}, listening...");
+                vad.reset();
+                match record_utterance(&rx, &mut vad, cfg)? {
+                    Some(audio) => handle_command(audio, &asr, &agent, &mut busy),
+                    None => println!(">> 没听到指令，回到待机"),
                 }
-                Err(e) => eprintln!(">> transcription failed: {e}"),
+                wake.reset();
             }
-            // loop back for a follow-up in the same ACP session
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                anyhow::bail!("audio capture stopped (input device gone?)")
+            }
         }
+    }
+}
 
-        wake.reset();
-        println!("== listening for wake word ==");
+/// Transcribe an utterance and dispatch it: a cancel keyword interrupts the
+/// current task; anything else is sent as a prompt (the supervisor redirects
+/// automatically if a turn is already running).
+fn handle_command(audio: Vec<i16>, asr: &asr::Asr, agent: &AgentHandle, busy: &mut bool) {
+    match asr.transcribe(&audio) {
+        Ok(text) if text.is_empty() => println!(">> 没听清，请再说一次"),
+        Ok(text) => {
+            println!(">> you said: {text}");
+            if is_cancel_intent(&text) {
+                println!(">> 打断当前任务");
+                agent.cancel();
+                *busy = false;
+            } else {
+                println!(">> asking agent...\n");
+                agent.prompt(text);
+                *busy = true;
+            }
+        }
+        Err(e) => eprintln!(">> transcription failed: {e}"),
     }
 }
 
