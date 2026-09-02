@@ -36,6 +36,12 @@ pub struct Settings {
     pub whisper: String,
     pub threshold: f32,
     pub kiro_args: String,
+    /// End the utterance after this much trailing silence.
+    pub silence_ms: u32,
+    /// Give up (back to wake word) if no speech starts within this window.
+    pub no_speech_ms: u32,
+    /// Hard cap on a single utterance.
+    pub max_utterance_ms: u32,
 }
 
 impl Default for Settings {
@@ -46,6 +52,9 @@ impl Default for Settings {
             whisper: "base".into(),
             threshold: 0.5,
             kiro_args: String::new(),
+            silence_ms: 1000,
+            no_speech_ms: 6000,
+            max_utterance_ms: 30000,
         }
     }
 }
@@ -79,6 +88,9 @@ pub fn load() -> Option<Settings> {
             "whisper" => s.whisper = v.into(),
             "threshold" => s.threshold = v.parse().unwrap_or(0.5),
             "kiro_args" => s.kiro_args = v.into(),
+            "silence_ms" => s.silence_ms = v.parse().unwrap_or(1000),
+            "no_speech_ms" => s.no_speech_ms = v.parse().unwrap_or(6000),
+            "max_utterance_ms" => s.max_utterance_ms = v.parse().unwrap_or(30000),
             _ => {}
         }
     }
@@ -90,8 +102,16 @@ pub fn save(s: &Settings) -> Result<()> {
     fs::write(
         config_path(),
         format!(
-            "wake_word={}\nlang={}\nwhisper={}\nthreshold={}\nkiro_args={}\n",
-            s.wake_word, s.lang, s.whisper, s.threshold, s.kiro_args
+            "wake_word={}\nlang={}\nwhisper={}\nthreshold={}\nkiro_args={}\n\
+             silence_ms={}\nno_speech_ms={}\nmax_utterance_ms={}\n",
+            s.wake_word,
+            s.lang,
+            s.whisper,
+            s.threshold,
+            s.kiro_args,
+            s.silence_ms,
+            s.no_speech_ms,
+            s.max_utterance_ms
         ),
     )?;
     Ok(())
@@ -161,6 +181,9 @@ pub fn interactive_setup(existing: Option<Settings>) -> Result<Settings> {
         whisper,
         threshold: cur.threshold,
         kiro_args: cur.kiro_args,
+        silence_ms: cur.silence_ms,
+        no_speech_ms: cur.no_speech_ms,
+        max_utterance_ms: cur.max_utterance_ms,
     };
     save(&settings)?;
     println!("\n已保存到 {} (随时可用 `voice-assistant setup` 修改)\n", config_path().display());

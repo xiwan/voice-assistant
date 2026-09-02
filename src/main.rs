@@ -42,6 +42,9 @@ struct Config {
     lang: String,
     asr_prompt: Option<String>,
     kiro_args: Vec<String>,
+    silence_ms: f32,
+    no_speech_ms: f32,
+    max_utterance_ms: f32,
 }
 
 impl Config {
@@ -87,6 +90,15 @@ impl Config {
                 .split_whitespace()
                 .map(String::from)
                 .collect(),
+            silence_ms: env("VA_SILENCE_MS", &settings.silence_ms.to_string())
+                .parse()
+                .unwrap_or(1000.0),
+            no_speech_ms: env("VA_NO_SPEECH_MS", &settings.no_speech_ms.to_string())
+                .parse()
+                .unwrap_or(6000.0),
+            max_utterance_ms: env("VA_MAX_UTTERANCE_MS", &settings.max_utterance_ms.to_string())
+                .parse()
+                .unwrap_or(30000.0),
         })
     }
 
@@ -125,6 +137,7 @@ fn main() -> Result<()> {
     let cfg = Config::load()?;
     match std::env::args().nth(1).as_deref() {
         Some("selftest") => selftest(&cfg),
+        Some("vad-wav") => vad_wav(&cfg),
         Some("test-wake") => test_wake(&cfg),
         Some("test-vad") => test_vad(&cfg),
         Some("test-asr") => test_asr(&cfg),
@@ -170,7 +183,7 @@ fn run(cfg: &Config) -> Result<()> {
         }
         println!("\x07>> wake word detected (score {score:.2}), listening...");
         vad.reset();
-        let audio = record_utterance(&rx, &mut vad, Vec::new())?;
+        let audio = record_utterance(&rx, &mut vad, Vec::new(), cfg)?;
         println!(">> transcribing {:.1}s of audio...", audio.len() as f32 / 16000.0);
         match asr.transcribe(&audio) {
             Ok(text) if text.is_empty() => println!(">> heard nothing, back to listening"),
@@ -195,6 +208,7 @@ fn record_utterance(
     rx: &Receiver<Vec<i16>>,
     vad: &mut vad::Vad,
     preroll: Vec<i16>,
+    cfg: &Config,
 ) -> Result<Vec<i16>> {
     const CHUNK_MS: f32 = VAD_CHUNK as f32 * 1000.0 / 16000.0; // 32 ms
     let mut audio = preroll;
@@ -218,13 +232,13 @@ fn record_utterance(
             }
             total_ms += CHUNK_MS;
         }
-        if speech_started && silence_ms >= 1000.0 {
-            break; // said something, then 1s of silence -> done
+        if speech_started && silence_ms >= cfg.silence_ms {
+            break; // said something, then went quiet -> done
         }
-        if !speech_started && total_ms >= 6000.0 {
+        if !speech_started && total_ms >= cfg.no_speech_ms {
             break; // never spoke -> give up
         }
-        if total_ms >= 30_000.0 {
+        if total_ms >= cfg.max_utterance_ms {
             break; // hard cap
         }
     }
@@ -232,6 +246,37 @@ fn record_utterance(
 }
 
 // ---------------- component tests ----------------
+
+/// Debug: run VAD over a 16 kHz mono s16 WAV file, print per-frame stats.
+fn vad_wav(cfg: &Config) -> Result<()> {
+    let path = std::env::args().nth(2).expect("usage: vad-wav <file.wav>");
+    let bytes = std::fs::read(&path)?;
+    // minimal RIFF parse: locate the "data" chunk
+    let pos = bytes
+        .windows(4)
+        .position(|w| w == b"data")
+        .expect("no data chunk");
+    let pcm = &bytes[pos + 8..];
+    let samples: Vec<i16> = pcm
+        .chunks_exact(2)
+        .map(|b| i16::from_le_bytes([b[0], b[1]]))
+        .collect();
+    let mut vad = cfg.vad()?;
+    let (mut n, mut speech, mut max_p) = (0u32, 0u32, 0f32);
+    for frame in samples.chunks_exact(VAD_CHUNK) {
+        let p = vad.predict(frame)?;
+        if p > 0.5 {
+            speech += 1;
+        }
+        max_p = max_p.max(p);
+        n += 1;
+    }
+    println!(
+        "{n} frames, {speech} speech frames ({:.0}%), max prob {max_p:.3}",
+        speech as f32 / n as f32 * 100.0
+    );
+    Ok(())
+}
 
 /// Headless sanity check: run every component on synthetic audio.
 fn selftest(cfg: &Config) -> Result<()> {
@@ -309,7 +354,7 @@ fn test_asr(cfg: &Config) -> Result<()> {
     let asr = cfg.asr()?;
     let (_cap, rx) = start_capture()?;
     println!("speak now (recording until 1s of silence)...");
-    let audio = record_utterance(&rx, &mut vad, Vec::new())?;
+    let audio = record_utterance(&rx, &mut vad, Vec::new(), cfg)?;
     println!("recorded {:.1}s, transcribing...", audio.len() as f32 / 16000.0);
     let text = asr.transcribe(&audio)?;
     println!("transcription: {text}");
