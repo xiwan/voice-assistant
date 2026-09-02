@@ -23,6 +23,13 @@ pub const WHISPER_SIZES: &[(&str, &str)] = &[
     ("medium", "medium (1.5GB, 最准, 稍慢)"),
 ];
 
+/// kiro-cli agent permission modes: (id, description).
+pub const AGENT_MODES: &[(&str, &str)] = &[
+    ("readonly", "只读       (只能读文件, 最安全)"),
+    ("safe", "安全命令   (可执行 pwd/ls/git status 等只读命令白名单)"),
+    ("full", "完全信任   (可执行任意命令和写文件, 听错指令有风险!)"),
+];
+
 const OWW_RELEASE: &str = "https://github.com/dscripka/openWakeWord/releases/download/v0.5.1";
 const SILERO_URL: &str =
     "https://github.com/snakers4/silero-vad/raw/master/src/silero_vad/data/silero_vad.onnx";
@@ -36,6 +43,8 @@ pub struct Settings {
     pub whisper: String,
     pub threshold: f32,
     pub kiro_args: String,
+    /// kiro-cli agent permission mode: readonly / safe / full.
+    pub agent_mode: String,
     /// End the utterance after this much trailing silence.
     pub silence_ms: u32,
     /// Give up (back to wake word) if no speech starts within this window.
@@ -52,6 +61,7 @@ impl Default for Settings {
             whisper: "base".into(),
             threshold: 0.5,
             kiro_args: String::new(),
+            agent_mode: "readonly".into(),
             silence_ms: 1000,
             no_speech_ms: 6000,
             max_utterance_ms: 30000,
@@ -88,6 +98,7 @@ pub fn load() -> Option<Settings> {
             "whisper" => s.whisper = v.into(),
             "threshold" => s.threshold = v.parse().unwrap_or(0.5),
             "kiro_args" => s.kiro_args = v.into(),
+            "agent_mode" => s.agent_mode = v.into(),
             "silence_ms" => s.silence_ms = v.parse().unwrap_or(1000),
             "no_speech_ms" => s.no_speech_ms = v.parse().unwrap_or(6000),
             "max_utterance_ms" => s.max_utterance_ms = v.parse().unwrap_or(30000),
@@ -103,12 +114,13 @@ pub fn save(s: &Settings) -> Result<()> {
         config_path(),
         format!(
             "wake_word={}\nlang={}\nwhisper={}\nthreshold={}\nkiro_args={}\n\
-             silence_ms={}\nno_speech_ms={}\nmax_utterance_ms={}\n",
+             agent_mode={}\nsilence_ms={}\nno_speech_ms={}\nmax_utterance_ms={}\n",
             s.wake_word,
             s.lang,
             s.whisper,
             s.threshold,
             s.kiro_args,
+            s.agent_mode,
             s.silence_ms,
             s.no_speech_ms,
             s.max_utterance_ms
@@ -175,12 +187,36 @@ pub fn interactive_setup(existing: Option<Settings>) -> Result<Settings> {
         _ => wchoice,
     };
 
+    println!("\n4) kiro-cli 权限 (语音指令允许 kiro 做什么):");
+    for (i, (_, desc)) in AGENT_MODES.iter().enumerate() {
+        println!("   {}. {desc}", i + 1);
+    }
+    let cur_midx = AGENT_MODES
+        .iter()
+        .position(|(id, _)| *id == cur.agent_mode)
+        .map(|i| i + 1)
+        .unwrap_or(1);
+    let mchoice = ask("权限编号", &cur_midx.to_string());
+    let agent_mode = match mchoice.parse::<usize>() {
+        Ok(n) if n >= 1 && n <= AGENT_MODES.len() => AGENT_MODES[n - 1].0.to_string(),
+        _ => mchoice,
+    };
+
+    // Generate the managed kiro-cli agent and route calls through it.
+    write_agent_config(&agent_mode)?;
+    let kiro_args = if cur.kiro_args.is_empty() {
+        "--agent voice".to_string()
+    } else {
+        cur.kiro_args
+    };
+
     let settings = Settings {
         wake_word,
         lang,
         whisper,
         threshold: cur.threshold,
-        kiro_args: cur.kiro_args,
+        kiro_args,
+        agent_mode,
         silence_ms: cur.silence_ms,
         no_speech_ms: cur.no_speech_ms,
         max_utterance_ms: cur.max_utterance_ms,
@@ -188,6 +224,59 @@ pub fn interactive_setup(existing: Option<Settings>) -> Result<Settings> {
     save(&settings)?;
     println!("\n已保存到 {} (随时可用 `voice-assistant setup` 修改)\n", config_path().display());
     Ok(settings)
+}
+
+/// Write the managed kiro-cli agent (~/.kiro/agents/voice.json) for the
+/// chosen permission mode. Overwrites previous content: this file is managed
+/// by `voice-assistant setup`.
+pub fn write_agent_config(mode: &str) -> Result<()> {
+    const PROMPT: &str = "你是一个语音助手的后端。用户的输入来自语音转文字，可能存在识别错误（同音字、专有名词错拼，如 kiro 被识别成 Kerro/Q row、目录被识别成末路），请结合上下文推断真实意图后再回答。回答尽量简短、口语化，适合朗读和快速浏览，避免长篇代码和表格。";
+    // Read-only shell commands auto-approved in "safe" mode (regex match).
+    const SAFE_COMMANDS: &str = r#""pwd.*", "ls .*", "ls", "cat .*", "head .*", "tail .*", "grep .*", "find .*", "df.*", "du .*", "ps.*", "date.*", "whoami", "uname.*", "which .*", "echo .*", "git status.*", "git log.*", "git diff.*", "git branch.*""#;
+    let body = match mode {
+        "safe" => format!(
+            r#"{{
+  "name": "voice",
+  "description": "Voice assistant agent (managed by voice-assistant setup, mode: safe)",
+  "mcpServers": {{}},
+  "tools": ["fs_read", "execute_bash"],
+  "allowedTools": ["fs_read"],
+  "toolsSettings": {{
+    "execute_bash": {{ "allowedCommands": [{SAFE_COMMANDS}] }}
+  }},
+  "prompt": "{PROMPT}"
+}}
+"#
+        ),
+        "full" => format!(
+            r#"{{
+  "name": "voice",
+  "description": "Voice assistant agent (managed by voice-assistant setup, mode: full)",
+  "mcpServers": {{}},
+  "tools": ["fs_read", "fs_write", "execute_bash"],
+  "allowedTools": ["fs_read", "fs_write", "execute_bash"],
+  "prompt": "{PROMPT}"
+}}
+"#
+        ),
+        _ => format!(
+            r#"{{
+  "name": "voice",
+  "description": "Voice assistant agent (managed by voice-assistant setup, mode: readonly)",
+  "mcpServers": {{}},
+  "tools": ["fs_read"],
+  "allowedTools": ["fs_read"],
+  "prompt": "{PROMPT}"
+}}
+"#
+        ),
+    };
+    let dir = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
+        .join(".kiro")
+        .join("agents");
+    fs::create_dir_all(&dir)?;
+    fs::write(dir.join("voice.json"), body)?;
+    Ok(())
 }
 
 /// Resolve the wake word classifier path (custom path or managed model file).
