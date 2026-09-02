@@ -179,11 +179,43 @@ fn sync_persona(cfg: &Config) {
     }
 }
 
-/// Keywords that mean "interrupt the current task" rather than "new request".
-fn is_cancel_intent(text: &str) -> bool {
-    const WORDS: &[&str] = &["停", "取消", "别说了", "停下", "闭嘴", "打断", "stop", "cancel"];
+/// What the user meant by a spoken command while a task exists.
+#[derive(Debug, PartialEq)]
+enum Intent {
+    /// Abandon the current/paused task entirely (drop the resumable).
+    Abandon,
+    /// Resume the previously paused task.
+    Resume,
+    /// Interrupt the running task but remember it so it can be resumed.
+    Pause,
+    /// A normal request.
+    New,
+}
+
+/// Classify a transcript. Order matters: "不用继续了" is Abandon, not Resume.
+fn classify_intent(text: &str) -> Intent {
+    const ABANDON: &[&str] = &["算了", "取消", "不用了", "不做了", "别做了", "别弄了", "不用继续"];
+    const RESUME: &[&str] = &["继续", "接着", "接下去", "接上"];
+    const PAUSE: &[&str] = &["暂停", "等等", "等一下", "等下", "稍等", "停一下", "先停", "停下", "停"];
     let t = text.to_lowercase();
-    WORDS.iter().any(|w| t.contains(w))
+    if ABANDON.iter().any(|w| t.contains(w)) {
+        Intent::Abandon
+    } else if RESUME.iter().any(|w| t.contains(w)) {
+        Intent::Resume
+    } else if PAUSE.iter().any(|w| t.contains(w)) {
+        Intent::Pause
+    } else {
+        Intent::New
+    }
+}
+
+/// Build the prompt that resumes a paused task. The session already retains the
+/// interruption and how far the agent got; re-stating the original task makes
+/// resume robust even after unrelated interjections in between.
+fn resume_prompt(task: &str) -> String {
+    format!(
+        "接着继续你刚才被打断的任务：「{task}」。从上次停下的地方继续，已经完成的部分不要重复。"
+    )
 }
 
 /// Block until the agent finishes the current turn (or dies), printing restarts.
@@ -235,18 +267,22 @@ fn agent_test(cfg: &Config) -> Result<()> {
         None
     };
 
-    println!("\n>> [1] long task, will cancel after 1.2s");
-    agent.prompt("从1数到100，每个数字占一行，并加一句简短说明。".into());
-    std::thread::sleep(Duration::from_millis(1200));
-    println!("\n>> sending cancel");
-    agent.cancel();
-    let r1 = drain_to_idle("cancel");
-    println!(">> after cancel, stopReason = {r1:?} (expect \"cancelled\")");
+    let task = "从1数到100，每个数字占一行，并加一句简短说明。";
 
-    println!("\n>> [2] continue on same session");
-    agent.prompt("刚才数到几了？一句话回答。".into());
-    let r2 = drain_to_idle("continue");
-    println!(">> after continue, stopReason = {r2:?} (expect \"end_turn\")");
+    println!("\n>> [1] start task, pause after 1.2s");
+    agent.prompt(task.into());
+    std::thread::sleep(Duration::from_millis(1200));
+    println!("\n>> PAUSE (cancel + remember)");
+    agent.cancel();
+    println!(">> paused, stopReason = {:?} (expect cancelled)", drain_to_idle("pause"));
+
+    println!("\n>> [interject] unrelated quick question");
+    agent.prompt("顺便说一句：星期三的英文怎么写？只回答单词。".into());
+    println!(">> interject stopReason = {:?}", drain_to_idle("interject"));
+
+    println!("\n>> [resume] 继续 the original task via resume_prompt");
+    agent.prompt(resume_prompt(task));
+    println!(">> resume stopReason = {:?} (expect end_turn)", drain_to_idle("resume"));
 
     agent.shutdown();
     Ok(())
@@ -274,39 +310,36 @@ fn run(cfg: &Config) -> Result<()> {
         cfg.wake_display
     );
 
-    // `busy` tracks whether a turn is running; `followup` opens a no-wake
-    // listening window right after a turn ends (multi-turn without re-waking).
-    let mut busy = false;
-    let mut followup = false;
+    // `Conv` holds the conversation state (busy / follow-up window / the running
+    // task / a paused-and-resumable task).
+    let mut conv = Conv::default();
 
     loop {
-        // Drain agent state without blocking: a finished turn arms a follow-up
-        // window; a restart is announced. (Audio is continuous, so state sent
-        // while we're parked on recv() below is picked up within milliseconds.)
+        // Drain agent state without blocking: a finished reply arms a follow-up
+        // window; a restart is announced. Cancellations are messaged by
+        // handle_command (暂停/取消), so we stay quiet on those here.
         for st in agent.state_rx.try_iter() {
             match st {
-                AgentState::Busy => busy = true,
+                AgentState::Busy => conv.busy = true,
                 AgentState::Idle(reason) => {
-                    if reason == "cancelled" {
-                        println!(">> 已停止");
-                    } else if busy {
-                        followup = true; // open a no-wake window after a real reply
+                    if reason != "cancelled" && conv.busy {
+                        conv.followup = true; // real reply -> listen without re-waking
                     }
-                    busy = false;
+                    conv.busy = false;
                 }
                 AgentState::Restarting(r) => {
                     eprintln!(">> agent 重启中: {r}");
-                    busy = false;
+                    conv.busy = false;
                 }
                 AgentState::Ready => {}
             }
         }
 
-        if followup {
-            followup = false;
+        if conv.followup {
+            conv.followup = false;
             vad.reset();
             match record_utterance(&rx, &mut vad, cfg)? {
-                Some(audio) => handle_command(audio, &asr, &agent, &mut busy),
+                Some(audio) => handle_command(audio, &asr, &agent, &mut conv),
                 None => println!(">> {}: 好的，我先下线待机了，需要时再叫我。", cfg.persona),
             }
             continue;
@@ -321,36 +354,84 @@ fn run(cfg: &Config) -> Result<()> {
         if score < cfg.wake_threshold {
             continue;
         }
-        let hint = if busy { "，打断中" } else { "" };
+        let hint = if conv.busy { "，打断中" } else { "" };
         println!("\x07>> wake word detected (score {score:.2}){hint}, listening...");
         vad.reset();
         match record_utterance(&rx, &mut vad, cfg)? {
-            Some(audio) => handle_command(audio, &asr, &agent, &mut busy),
+            Some(audio) => handle_command(audio, &asr, &agent, &mut conv),
             None => println!(">> 没听到指令，回到待机"),
         }
         wake.reset();
     }
 }
 
-/// Transcribe an utterance and dispatch it: a cancel keyword interrupts the
-/// current task; anything else is sent as a prompt (the supervisor redirects
-/// automatically if a turn is already running).
-fn handle_command(audio: Vec<i16>, asr: &asr::Asr, agent: &AgentHandle, busy: &mut bool) {
-    match asr.transcribe(&audio) {
-        Ok(text) if text.is_empty() => println!(">> 没听清，请再说一次"),
-        Ok(text) => {
-            println!(">> you said: {text}");
-            if is_cancel_intent(&text) {
-                println!(">> 打断当前任务");
+/// Conversation state for the main loop.
+#[derive(Default)]
+struct Conv {
+    /// A turn is currently running.
+    busy: bool,
+    /// Open a no-wake listening window on the next loop (follow-up / after pause).
+    followup: bool,
+    /// Text of the task currently running (so pause can remember it).
+    current_task: Option<String>,
+    /// A paused task, resumed by "继续". Sticky: survives interjections.
+    resumable: Option<String>,
+}
+
+/// Transcribe an utterance and dispatch by intent: pause remembers the running
+/// task for later; resume re-launches it; abandon clears it; anything else is a
+/// new request (the supervisor auto-redirects if a turn is already running).
+fn handle_command(audio: Vec<i16>, asr: &asr::Asr, agent: &AgentHandle, conv: &mut Conv) {
+    let text = match asr.transcribe(&audio) {
+        Ok(t) if t.is_empty() => {
+            println!(">> 没听清，请再说一次");
+            return;
+        }
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!(">> transcription failed: {e}");
+            return;
+        }
+    };
+    println!(">> you said: {text}");
+    match classify_intent(&text) {
+        Intent::Pause => {
+            if conv.busy {
                 agent.cancel();
-                *busy = false;
+                conv.resumable = conv.current_task.clone();
+                conv.busy = false;
+                conv.followup = true; // keep listening for the interjection or 继续
+                println!(">> 已暂停，说“继续”接着做，或直接下别的指令");
             } else {
-                println!(">> asking agent...\n");
-                agent.prompt(text);
-                *busy = true;
+                println!(">> 现在没有进行中的任务");
             }
         }
-        Err(e) => eprintln!(">> transcription failed: {e}"),
+        Intent::Resume => {
+            if let Some(task) = conv.resumable.take() {
+                println!(">> 继续刚才的任务");
+                agent.prompt(resume_prompt(&task));
+                conv.current_task = Some(task);
+                conv.busy = true;
+            } else {
+                println!(">> 没有可继续的任务");
+            }
+        }
+        Intent::Abandon => {
+            if conv.busy {
+                agent.cancel();
+            }
+            conv.busy = false;
+            conv.current_task = None;
+            conv.resumable = None;
+            println!(">> 好的，取消了");
+        }
+        Intent::New => {
+            println!(">> asking agent...\n");
+            agent.prompt(text.clone());
+            conv.current_task = Some(text);
+            conv.busy = true;
+            // resumable stays sticky: this may be an interjection while paused
+        }
     }
 }
 
@@ -529,4 +610,45 @@ fn test_asr(cfg: &Config) -> Result<()> {
         None => println!("no speech detected"),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pause_words() {
+        for s in ["暂停", "等等", "等一下", "稍等", "停一下", "停", "先停一下再说"] {
+            assert_eq!(classify_intent(s), Intent::Pause, "{s}");
+        }
+    }
+
+    #[test]
+    fn resume_words() {
+        for s in ["继续", "接着刚才的", "接下去", "你继续吧"] {
+            assert_eq!(classify_intent(s), Intent::Resume, "{s}");
+        }
+    }
+
+    #[test]
+    fn abandon_words() {
+        // Abandon must win even when the phrase also contains 继续.
+        for s in ["算了", "取消", "不用了", "不用继续了", "别做了"] {
+            assert_eq!(classify_intent(s), Intent::Abandon, "{s}");
+        }
+    }
+
+    #[test]
+    fn new_requests() {
+        for s in ["帮我看下今天天气", "列出当前目录的文件", "打开日历"] {
+            assert_eq!(classify_intent(s), Intent::New, "{s}");
+        }
+    }
+
+    #[test]
+    fn resume_prompt_restates_task() {
+        let p = resume_prompt("把报告写完");
+        assert!(p.contains("把报告写完"));
+        assert!(p.contains("继续"));
+    }
 }
