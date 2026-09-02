@@ -21,6 +21,8 @@ macOS / Linux 上的本地语音助手：说出唤醒词，语音指令自动转
 - 模型按需自动下载（首次约 145MB–1.5GB，取决于所选 whisper 模型）
 - 中文友好：简体输出引导、hf-mirror 下载源
 - 会话连续性：ACP agent 常驻，多轮指令共享同一会话上下文，且无每轮冷启动
+- 追问免唤醒：回答后进入追问窗口，直接接着说即可多轮对话，静默超时自动播报下线
+- 人格绑定唤醒词：连接的 agent 自动以唤醒词为名（如 "Jarvis"），自我介绍即是该名字
 - kiro-cli 权限三档：只读 / 安全命令白名单 / 完全信任
 
 ## 依赖
@@ -42,7 +44,9 @@ cargo build --release
 ```
 
 说出唤醒词（默认 "Hey Jarvis"），听到提示后说出指令，说完停顿 1 秒自动结束，
-识别文本会交给 kiro-cli，回答流式打印到终端。
+识别文本会交给 agent，回答流式打印到终端。回答后进入**追问窗口**：直接接着说即可
+继续对话（无需再念唤醒词，共享同一会话上下文）；`no_speech_ms` 内没开口，助手会
+播报一句下线提示并回到等唤醒词状态。
 
 ## 命令
 
@@ -69,7 +73,7 @@ cargo build --release
 | `agent_mode` | — | readonly | kiro 权限：readonly / safe / full |
 | `agent_cmd` | `VA_AGENT_CMD` | kiro-cli acp --agent voice | ACP agent 启动命令（换后端只改这里） |
 | `silence_ms` | `VA_SILENCE_MS` | 1000 | 说完停顿多久算结束 |
-| `no_speech_ms` | `VA_NO_SPEECH_MS` | 6000 | 唤醒后不说话多久放弃 |
+| `no_speech_ms` | `VA_NO_SPEECH_MS` | 6000 | 唤醒后 / 追问窗口内不说话多久放弃（超时播报下线） |
 | `max_utterance_ms` | `VA_MAX_UTTERANCE_MS` | 30000 | 单次录音上限 |
 | — | `VA_MODELS_DIR` | ~/.voice-assistant/models | 模型目录 |
 | — | `VA_HF_BASE` | https://hf-mirror.com | HuggingFace 下载源 |
@@ -88,9 +92,14 @@ setup 第 4 步选择后端：默认 **kiro-cli**（自动生成并管理权限�
 ACP 是通用协议，切换后端不需要改代码。自定义后端会询问是否自动批准工具授权（语音
 场景无法交互确认），也可随时直接编辑 config 里的 `agent_cmd`。
 
+对 kiro-cli 后端，助手会以唤醒词为 agent 的名字（如 "Hey Jarvis" → agent 自称
+"Jarvis"）：启动时按当前唤醒词自动重写 `~/.kiro/agents/voice.json` 的身份 prompt，
+所以连接的 kiro 就等同于你唤醒的那个人格。自定义后端的人格由其自身管理。
+
 ### kiro-cli 权限模式
 
-setup 会按所选模式生成 `~/.kiro/agents/voice.json`（该文件由 setup 托管，重新设置会覆盖）：
+setup 会按所选模式生成 `~/.kiro/agents/voice.json`（该文件由 voice-assistant 托管：
+setup 重设或每次启动都会按当前唤醒词/权限重写，请勿手改）：
 
 - **readonly** — 只能读文件，最安全
 - **safe** — 额外放行只读命令白名单（pwd / ls / cat / git status 等），

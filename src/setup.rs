@@ -241,7 +241,7 @@ pub fn interactive_setup(existing: Option<Settings>) -> Result<Settings> {
             Ok(n) if n >= 1 && n <= AGENT_MODES.len() => AGENT_MODES[n - 1].0.to_string(),
             _ => mchoice,
         };
-        write_agent_config(&mode)?;
+        write_agent_config(&mode, &persona_name(&wake_word))?;
         // "full" adds -a so the agent auto-approves tool use.
         let mut c = "kiro-cli acp --agent voice".to_string();
         if mode == "full" {
@@ -281,11 +281,36 @@ pub fn interactive_setup(existing: Option<Settings>) -> Result<Settings> {
     Ok(settings)
 }
 
-/// Write the managed kiro-cli agent (~/.kiro/agents/voice.json) for the
-/// chosen permission mode. Overwrites previous content: this file is managed
-/// by `voice-assistant setup`.
-pub fn write_agent_config(mode: &str) -> Result<()> {
-    const PROMPT: &str = "你是一个语音助手的后端。用户的输入来自语音转文字，可能存在识别错误（同音字、专有名词错拼，如 kiro 被识别成 Kerro/Q row、目录被识别成末路），请结合上下文推断真实意图后再回答。回答尽量简短、口语化，适合朗读和快速浏览，避免长篇代码和表格。";
+/// Persona name for the connected agent, derived from the wake word
+/// (e.g. `hey_jarvis` -> "Jarvis"). This makes the agent identify as the wake
+/// word rather than as "kiro": the wake word IS the assistant's name.
+pub fn persona_name(wake_word: &str) -> String {
+    if let Some((_, display)) = WAKE_WORDS.iter().find(|(id, _)| *id == wake_word) {
+        return display.strip_prefix("Hey ").unwrap_or(display).to_string();
+    }
+    // Custom .onnx path or unknown id: derive a name from the file stem.
+    let stem = std::path::Path::new(wake_word)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(wake_word)
+        .trim_end_matches("_v0.1");
+    let mut chars = stem.chars();
+    match chars.next() {
+        Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
+        None => "Jarvis".to_string(),
+    }
+}
+
+/// Write the managed kiro-cli agent (~/.kiro/agents/voice.json) for the chosen
+/// permission mode, with the agent's identity bound to `persona` (the wake
+/// word). Overwrites previous content: this file is managed by voice-assistant.
+pub fn write_agent_config(mode: &str, persona: &str) -> Result<()> {
+    let prompt = format!(
+        "你的名字是 {persona}，是用户的私人语音助手。有人问你是谁，就回答你是 {persona}。\
+         用户的输入来自语音转文字，可能存在识别错误（同音字、专有名词错拼，如 kiro 被识别成 \
+         Kerro/Q row、目录被识别成末路），请结合上下文推断真实意图后再回答。回答尽量简短、\
+         口语化，适合朗读和快速浏览，避免长篇代码和表格。"
+    );
     // Read-only shell commands auto-approved in "safe" mode (regex match).
     const SAFE_COMMANDS: &str = r#""pwd.*", "ls .*", "ls", "cat .*", "head .*", "tail .*", "grep .*", "find .*", "df.*", "du .*", "ps.*", "date.*", "whoami", "uname.*", "which .*", "echo .*", "git status.*", "git log.*", "git diff.*", "git branch.*""#;
     let body = match mode {
@@ -299,7 +324,7 @@ pub fn write_agent_config(mode: &str) -> Result<()> {
   "toolsSettings": {{
     "execute_bash": {{ "allowedCommands": [{SAFE_COMMANDS}] }}
   }},
-  "prompt": "{PROMPT}"
+  "prompt": "{prompt}"
 }}
 "#
         ),
@@ -310,7 +335,7 @@ pub fn write_agent_config(mode: &str) -> Result<()> {
   "mcpServers": {{}},
   "tools": ["fs_read", "fs_write", "execute_bash"],
   "allowedTools": ["fs_read", "fs_write", "execute_bash"],
-  "prompt": "{PROMPT}"
+  "prompt": "{prompt}"
 }}
 "#
         ),
@@ -321,7 +346,7 @@ pub fn write_agent_config(mode: &str) -> Result<()> {
   "mcpServers": {{}},
   "tools": ["fs_read"],
   "allowedTools": ["fs_read"],
-  "prompt": "{PROMPT}"
+  "prompt": "{prompt}"
 }}
 "#
         ),

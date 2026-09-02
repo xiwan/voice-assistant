@@ -45,6 +45,10 @@ struct Config {
     agent_cmd: Vec<String>,
     /// Auto-approve tool-permission requests (maps from the "full" trust mode).
     auto_approve: bool,
+    /// kiro-cli permission mode (readonly/safe/full); used to refresh voice.json.
+    agent_mode: String,
+    /// Assistant persona name derived from the wake word (e.g. "Jarvis").
+    persona: String,
     silence_ms: f32,
     no_speech_ms: f32,
     max_utterance_ms: f32,
@@ -94,6 +98,8 @@ impl Config {
                 .map(String::from)
                 .collect(),
             auto_approve: settings.agent_mode == "full",
+            agent_mode: settings.agent_mode.clone(),
+            persona: setup::persona_name(&settings.wake_word),
             silence_ms: env("VA_SILENCE_MS", &settings.silence_ms.to_string())
                 .parse()
                 .unwrap_or(1000.0),
@@ -160,12 +166,24 @@ fn start_capture() -> Result<(audio::Capture, Receiver<Vec<i16>>)> {
     Ok((cap, rx))
 }
 
+/// For the kiro backend, regenerate ~/.kiro/agents/voice.json so the agent's
+/// identity always matches the current wake word (the wake word is its name).
+/// No-op for custom ACP backends, which manage their own persona.
+fn sync_persona(cfg: &Config) {
+    if cfg.agent_cmd.first().map(|s| s == "kiro-cli").unwrap_or(false) {
+        if let Err(e) = setup::write_agent_config(&cfg.agent_mode, &cfg.persona) {
+            eprintln!("[setup] warning: could not refresh voice.json: {e}");
+        }
+    }
+}
+
 /// Headless ACP check (no mic): spawn the agent once and send each argument as
 /// a prompt in the SAME session, so multiple prompts prove session continuity.
 ///   voice-assistant ask "remember 42" "what number did I say?"
 fn ask_cli(cfg: &Config) -> Result<()> {
     let prompts: Vec<String> = std::env::args().skip(2).collect();
     anyhow::ensure!(!prompts.is_empty(), "usage: voice-assistant ask <text> [more text...]");
+    sync_persona(cfg);
     eprintln!("[acp] starting agent: {}", cfg.agent_cmd.join(" "));
     let mut client = acp::AcpClient::spawn(&cfg.agent_cmd, cfg.auto_approve)?;
     for (i, p) in prompts.iter().enumerate() {
@@ -183,8 +201,13 @@ fn run(cfg: &Config) -> Result<()> {
     let asr = cfg.asr()?;
     let (_cap, rx) = start_capture()?;
 
+    // Keep the managed kiro agent's identity in sync with the wake word, so the
+    // connected agent introduces itself as e.g. "Jarvis" rather than "kiro".
+    // Only for the kiro backend; custom ACP agents manage their own persona.
+    sync_persona(cfg);
+
     // Launch the agent ONCE and keep it alive: no per-turn cold start, and the
-    // conversation keeps its context across wake cycles (session continuity).
+    // conversation keeps its context across turns (session continuity).
     eprintln!("[acp] starting agent: {}", cfg.agent_cmd.join(" "));
     let mut client = acp::AcpClient::spawn(&cfg.agent_cmd, cfg.auto_approve)?;
 
@@ -195,6 +218,7 @@ fn run(cfg: &Config) -> Result<()> {
     let mut preroll: VecDeque<i16> = VecDeque::new(); // ~0.5s of pre-wake audio
 
     loop {
+        // ---- wait for the wake word ----
         let chunk = rx.recv()?;
         preroll.extend(chunk.iter().copied());
         while preroll.len() > 8000 {
@@ -207,29 +231,46 @@ fn run(cfg: &Config) -> Result<()> {
             continue;
         }
         println!("\x07>> wake word detected (score {score:.2}), listening...");
-        vad.reset();
-        let audio = record_utterance(&rx, &mut vad, Vec::new(), cfg)?;
-        println!(">> transcribing {:.1}s of audio...", audio.len() as f32 / 16000.0);
-        match asr.transcribe(&audio) {
-            Ok(text) if text.is_empty() => println!(">> heard nothing, back to listening"),
-            Ok(text) => {
-                println!(">> you said: {text}");
-                println!(">> asking agent...\n");
-                // A dead/broken agent process shouldn't kill the assistant:
-                // report, respawn a fresh session, and retry once.
-                if let Err(e) = client.prompt(&text) {
-                    eprintln!("\n>> agent prompt failed: {e}; restarting agent...");
-                    if let Err(e) = client.respawn() {
-                        eprintln!(">> failed to restart agent: {e}");
-                    } else if let Err(e) = client.prompt(&text) {
-                        eprintln!(">> retry after restart failed: {e}");
+
+        // ---- conversation: first turn + follow-ups, no re-waking needed ----
+        // Each turn opens a listening window of `no_speech_ms`; if the user
+        // stays silent that long, the assistant announces standby and returns
+        // to wake-word mode. Otherwise the utterance continues the same session.
+        loop {
+            while rx.try_recv().is_ok() {} // drop audio buffered during reply/ASR
+            vad.reset();
+            let audio = match record_utterance(&rx, &mut vad, Vec::new(), cfg)? {
+                Some(a) => a,
+                None => {
+                    println!(">> {}: 好的，我先下线待机了，需要时再叫我。", cfg.persona);
+                    break;
+                }
+            };
+            println!(">> transcribing {:.1}s of audio...", audio.len() as f32 / 16000.0);
+            match asr.transcribe(&audio) {
+                Ok(text) if text.is_empty() => {
+                    println!(">> 没听清，请再说一次");
+                    continue;
+                }
+                Ok(text) => {
+                    println!(">> you said: {text}");
+                    println!(">> asking agent...\n");
+                    // A dead/broken agent process shouldn't kill the assistant:
+                    // report, respawn a fresh session, and retry once.
+                    if let Err(e) = client.prompt(&text) {
+                        eprintln!("\n>> agent prompt failed: {e}; restarting agent...");
+                        if let Err(e) = client.respawn() {
+                            eprintln!(">> failed to restart agent: {e}");
+                        } else if let Err(e) = client.prompt(&text) {
+                            eprintln!(">> retry after restart failed: {e}");
+                        }
                     }
                 }
+                Err(e) => eprintln!(">> transcription failed: {e}"),
             }
-            Err(e) => eprintln!(">> transcription failed: {e}"),
+            // loop back for a follow-up in the same ACP session
         }
-        // drop anything captured while ASR/agent were running, then re-arm
-        while rx.try_recv().is_ok() {}
+
         wake.reset();
         preroll.clear();
         println!("== listening for wake word ==");
@@ -237,12 +278,14 @@ fn run(cfg: &Config) -> Result<()> {
 }
 
 /// Record until the speaker stops talking (VAD-based endpointing).
+/// Returns `None` if no speech started within `no_speech_ms` (the caller uses
+/// this to fall back to wake-word mode), otherwise the captured utterance.
 fn record_utterance(
     rx: &Receiver<Vec<i16>>,
     vad: &mut vad::Vad,
     preroll: Vec<i16>,
     cfg: &Config,
-) -> Result<Vec<i16>> {
+) -> Result<Option<Vec<i16>>> {
     const CHUNK_MS: f32 = VAD_CHUNK as f32 * 1000.0 / 16000.0; // 32 ms
     let mut audio = preroll;
     let mut pending: Vec<i16> = Vec::new();
@@ -275,7 +318,7 @@ fn record_utterance(
             break; // hard cap
         }
     }
-    Ok(audio)
+    Ok(if speech_started { Some(audio) } else { None })
 }
 
 // ---------------- component tests ----------------
@@ -387,9 +430,13 @@ fn test_asr(cfg: &Config) -> Result<()> {
     let asr = cfg.asr()?;
     let (_cap, rx) = start_capture()?;
     println!("speak now (recording until 1s of silence)...");
-    let audio = record_utterance(&rx, &mut vad, Vec::new(), cfg)?;
-    println!("recorded {:.1}s, transcribing...", audio.len() as f32 / 16000.0);
-    let text = asr.transcribe(&audio)?;
-    println!("transcription: {text}");
+    match record_utterance(&rx, &mut vad, Vec::new(), cfg)? {
+        Some(audio) => {
+            println!("recorded {:.1}s, transcribing...", audio.len() as f32 / 16000.0);
+            let text = asr.transcribe(&audio)?;
+            println!("transcription: {text}");
+        }
+        None => println!("no speech detected"),
+    }
     Ok(())
 }
