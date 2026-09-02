@@ -1,3 +1,8 @@
 /target
 *.log
 .DS_Store
+# AIDLC local working files
+OPERATIONS.md
+versions/
+design/
+scratch/
