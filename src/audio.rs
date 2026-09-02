@@ -3,6 +3,8 @@
 use anyhow::{anyhow, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crossbeam_channel::Sender;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 pub const TARGET_RATE: u32 = 16000;
 
@@ -14,7 +16,14 @@ pub struct Capture {
 impl Capture {
     /// Start capturing from the default input device.
     /// Sends chunks of 16 kHz mono i16 samples to `tx`.
-    pub fn start(tx: Sender<Vec<i16>>) -> Result<Self> {
+    ///
+    /// Audio always flows live (never zeroed): the streaming wake-word detector
+    /// must hear the user even while the assistant is speaking, so
+    /// "（唤醒词）停" can barge in mid-reply. Self-hearing is prevented
+    /// downstream instead — command capture only runs after playback is
+    /// stopped (on wake) or finished (follow-up). `_muted` (raised by the TTS
+    /// player) is retained for a future AEC reference signal.
+    pub fn start(tx: Sender<Vec<i16>>, _muted: Arc<AtomicBool>) -> Result<Self> {
         let host = cpal::default_host();
         let device = host
             .default_input_device()

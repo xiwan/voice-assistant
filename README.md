@@ -4,9 +4,9 @@ macOS / Linux 上的本地语音助手：说出唤醒词，语音指令自动转
 [kiro-cli](https://kiro.dev) 执行。纯 Rust 单二进制，推理全部本地运行，无云端依赖。
 
 ```
-麦克风 ──► 唤醒词检测 ──► VAD 断句录音 ──► 语音转文字 ──► ACP agent
- cpal      openWakeWord      Silero VAD      whisper.cpp     常驻进程 (JSON-RPC/stdio)
-           (onnxruntime)    (onnxruntime)   (macOS Metal 加速)  默认 kiro-cli acp
+麦克风 ──► 唤醒词检测 ──► VAD 断句录音 ──► 语音转文字 ──► ACP agent ──► 流式 TTS
+ cpal      openWakeWord      Silero VAD      whisper.cpp     常驻进程        macOS say
+           (onnxruntime)    (onnxruntime)   (macOS Metal 加速)  (JSON-RPC/stdio)  (可换 Piper)
 ```
 
 后端通过 **ACP（Agent Client Protocol）** 对接：agent 进程只启动一次并常驻，多轮
@@ -18,13 +18,18 @@ agent 由一个独立的 **supervisor 线程**托管：主循环永不阻塞，�
 supervisor 保证任何时刻**有且只有一个** agent 存活——崩溃/卡死会自动重启（指数退避），
 且绝不残留僵尸进程。
 
+回答会**边生成边念**：文字一到句子结尾就送去合成，不等整段回答写完，所以说话节奏跟着
+输出走。只念"它想说的话"——思考过程、工具调用、代码块、表格、URL 都不念。播放期间
+麦克风输入自动静音（半双工），否则助手会听见自己说话、把自己的声音当成新指令。
+
 ## 特性
 
-- 全本地推理：唤醒词 / VAD / ASR 都在本机跑，语音数据不出机器
+- 全本地推理：唤醒词 / VAD / ASR / TTS 都在本机跑，语音数据不出机器
 - 单二进制部署：`cargo build` 出一个可执行文件，拷走即用
-- 首次运行交互式设置：唤醒词、识别语言、模型精度、agent 权限，配置持久化
+- 首次运行交互式设置：唤醒词、识别语言、模型精度、agent 权限、语音回复，配置持久化
 - 模型按需自动下载（首次约 145MB–1.5GB，取决于所选 whisper 模型）
-- 中文友好：简体输出引导、hf-mirror 下载源
+- 中文友好：简体输出引导、中文音色、hf-mirror 下载源
+- 流式语音回复：按句边生成边念，不等整段答案；只念回答本身，思考/工具/代码块不念
 - 会话连续性：ACP agent 常驻，多轮指令共享同一会话上下文，且无每轮冷启动
 - 主循环不阻塞：任务执行时也在听，随时可"（唤醒词）停"打断，或直接改口下达新指令
 - 打断可续接：说"暂停/等等"先停下、去做别的，再说"继续"接着原任务干（同会话记忆）
@@ -81,6 +86,7 @@ cargo build --release
 | `voice-assistant test-wake` | 唤醒词调试：实时打印检测得分 |
 | `voice-assistant test-vad` | VAD 调试：实时打印语音概率 |
 | `voice-assistant test-asr` | 录一句话并打印转写结果 |
+| `voice-assistant test-tts` | 语音回复调试：模拟流式回答并朗读（`--interrupt` 试打断） |
 | `voice-assistant selftest` | 无麦克风自检（合成音频过一遍全部组件） |
 
 ## 配置
@@ -95,6 +101,9 @@ cargo build --release
 | `threshold` | `VA_WAKE_THRESHOLD` | 0.5 | 唤醒词检测阈值 |
 | `agent_mode` | — | readonly | kiro 权限：readonly / safe / full |
 | `agent_cmd` | `VA_AGENT_CMD` | kiro-cli acp --agent voice | ACP agent 启动命令（换后端只改这里） |
+| `tts` | `VA_TTS` | say (macOS) / off | 语音回复引擎：say / off |
+| `tts_voice` | `VA_TTS_VOICE` | 自动 | 音色，留空则按语言选（zh → Tingting） |
+| `tts_rate` | `VA_TTS_RATE` | 0 | 语速（字/分钟），0 = 引擎默认 |
 | `silence_ms` | `VA_SILENCE_MS` | 1000 | 说完停顿多久算结束 |
 | `no_speech_ms` | `VA_NO_SPEECH_MS` | 6000 | 唤醒后 / 追问窗口内不说话多久放弃（超时播报下线） |
 | `max_utterance_ms` | `VA_MAX_UTTERANCE_MS` | 30000 | 单次录音上限 |
@@ -107,6 +116,22 @@ cargo build --release
 
 内置四个 openWakeWord 预训练唤醒词：Hey Jarvis / Alexa / Hey Mycroft / Hey Rhasspy。
 也可以在 setup 中填入自己[训练的 openWakeWord 模型](https://github.com/dscripka/openWakeWord#training-new-models)（.onnx 路径）。
+
+### 语音回复
+
+setup 第 5 步开关，默认在 macOS 上开启，引擎是系统内置的 `say`（零依赖）。
+
+- **边生成边念**：回答文字一到句子结尾（。！？；或换行）就立刻送去合成；长句子超过
+  48 字还没标点，会在逗号处先切一段出来念，所以开口时机跟着生成走，不用等整段写完。
+- **只念该念的**：只有回答正文进 TTS。思考过程、工具调用、代码块、表格、分隔线一律
+  跳过，行内的 markdown 标记会去掉，URL 念成"链接"。
+- **半双工**：播放期间麦克风输入被静音，否则助手会听见自己的声音并当成新指令（死循环）。
+  代价是**朗读过程中没法用语音打断**——想插话就等这句念完，或者按 Ctrl-C。念完 250ms
+  后自动恢复收音（留一点时间让房间回声散掉）。
+- 你一开口下新指令，正在念的内容会立刻掐掉（`say` 进程被 kill）。
+
+音色用 `say -v '?'` 看全部；中文默认 Tingting。换引擎只需要加一个 `Engine` 实现，
+流水线代码不用动——Piper（本地神经 TTS，音质更好）就是按这条路加进来的下一步。
 
 ### Agent 后端
 
@@ -144,12 +169,17 @@ setup 重设或每次启动都会按当前唤醒词/权限重写，请勿手改�
 - **听不到唤醒**：`voice-assistant test-wake` 看得分，长期低于 0.5 可降低 `threshold`
 - **没有输入设备**：确认终端有麦克风权限；`voice-assistant devices` 列出设备
 - **中文识别差**：`setup` 换 small/medium 模型
+- **听不到语音回复**：`voice-assistant test-tts` 直接试；确认 `tts=say`（Linux 暂无内置引擎）
+- **助手把自己的话当指令**：播放期间本应自动静音；若仍复发，说明外放音量过大导致
+  静音尾巴（250ms）不够，先调低音量或改用耳机
 - **agent 响应慢**：默认走 `kiro-cli acp --agent voice`（ACP 常驻进程，无 MCP 冷启动、多轮不重启）；`setup` 会自动配置
 - **模型下载慢/失败**：`VA_HF_BASE` 换源，或手动下载放入模型目录
 
 ## Roadmap
 
-- [ ] TTS 语音回复
+- [x] TTS 语音回复 — 流式按句朗读，macOS `say`（半双工，播放时静音麦克风）
+- [ ] Piper 本地神经 TTS（音质升级，接口已抽好，只需加一个 `Engine` 实现）
+- [ ] 朗读时也能语音打断（需要 AEC 或唤醒词专用旁路，当前是半双工）
 - [x] 会话连续性（多轮对话保持上下文）— 通过常驻 ACP agent 实现
 - [ ] 更多 agent 后端（ACP 通用协议，改 `agent_cmd` 即可接入其它 ACP agent）
 - [ ] 中文自定义唤醒词

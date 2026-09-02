@@ -53,6 +53,12 @@ pub struct Settings {
     pub no_speech_ms: u32,
     /// Hard cap on a single utterance.
     pub max_utterance_ms: u32,
+    /// Spoken replies: "off" or "say" (macOS `say`).
+    pub tts: String,
+    /// Voice name for the engine; empty = pick by language (zh -> Tingting).
+    pub tts_voice: String,
+    /// Words per minute; 0 = engine default.
+    pub tts_rate: u32,
 }
 
 impl Default for Settings {
@@ -67,6 +73,9 @@ impl Default for Settings {
             silence_ms: 1000,
             no_speech_ms: 6000,
             max_utterance_ms: 30000,
+            tts: if cfg!(target_os = "macos") { "say".into() } else { "off".into() },
+            tts_voice: String::new(),
+            tts_rate: 0,
         }
     }
 }
@@ -118,6 +127,9 @@ pub fn load() -> Option<Settings> {
             "silence_ms" => s.silence_ms = v.parse().unwrap_or(1000),
             "no_speech_ms" => s.no_speech_ms = v.parse().unwrap_or(6000),
             "max_utterance_ms" => s.max_utterance_ms = v.parse().unwrap_or(30000),
+            "tts" => s.tts = v.into(),
+            "tts_voice" => s.tts_voice = v.into(),
+            "tts_rate" => s.tts_rate = v.parse().unwrap_or(0),
             _ => {}
         }
     }
@@ -130,7 +142,8 @@ pub fn save(s: &Settings) -> Result<()> {
         config_path(),
         format!(
             "wake_word={}\nlang={}\nwhisper={}\nthreshold={}\nagent_cmd={}\n\
-             agent_mode={}\nsilence_ms={}\nno_speech_ms={}\nmax_utterance_ms={}\n",
+             agent_mode={}\nsilence_ms={}\nno_speech_ms={}\nmax_utterance_ms={}\n\
+             tts={}\ntts_voice={}\ntts_rate={}\n",
             s.wake_word,
             s.lang,
             s.whisper,
@@ -139,7 +152,10 @@ pub fn save(s: &Settings) -> Result<()> {
             s.agent_mode,
             s.silence_ms,
             s.no_speech_ms,
-            s.max_utterance_ms
+            s.max_utterance_ms,
+            s.tts,
+            s.tts_voice,
+            s.tts_rate
         ),
     )?;
     Ok(())
@@ -250,8 +266,25 @@ pub fn interactive_setup(existing: Option<Settings>) -> Result<Settings> {
         (c, mode)
     };
 
-    // 5) Runtime tuning. Enter keeps the current value.
-    println!("\n5) 运行参数 (回车保留当前值):");
+    // 5) Spoken replies. Half duplex: the mic is muted while speaking, so a
+    //    long answer can't be interrupted by voice mid-sentence.
+    println!("\n5) 语音回复 (把回答念出来):");
+    println!("   1. 开   (macOS 内置 say, 边生成边念)");
+    println!("   2. 关   (只在终端显示文字)");
+    let cur_tts_on = cur.tts != "off";
+    let tchoice = ask("语音回复", if cur_tts_on { "1" } else { "2" });
+    let (tts, tts_voice, tts_rate) = if tchoice.trim() == "2" {
+        ("off".to_string(), cur.tts_voice.clone(), cur.tts_rate)
+    } else {
+        let v = ask("音色 (留空=按语言自动, 中文用 Tingting; `say -v ?` 看全部)", &cur.tts_voice);
+        let r = ask("语速 (字/分钟, 0=默认)", &cur.tts_rate.to_string())
+            .parse()
+            .unwrap_or(cur.tts_rate);
+        ("say".to_string(), v, r)
+    };
+
+    // 6) Runtime tuning. Enter keeps the current value.
+    println!("\n6) 运行参数 (回车保留当前值):");
     let threshold = ask("唤醒阈值 (0-1, 越低越灵敏)", &cur.threshold.to_string())
         .parse()
         .unwrap_or(cur.threshold);
@@ -275,6 +308,9 @@ pub fn interactive_setup(existing: Option<Settings>) -> Result<Settings> {
         silence_ms,
         no_speech_ms,
         max_utterance_ms,
+        tts,
+        tts_voice,
+        tts_rate,
     };
     save(&settings)?;
     println!("\n已保存到 {} (随时可用 `voice-assistant setup` 修改)\n", config_path().display());

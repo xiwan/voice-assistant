@@ -20,6 +20,7 @@
 //! spends time thinking or in tools never looks like a hang. Agent-specific
 //! notifications (kiro's `_kiro.dev/*`) are ignored.
 
+use crate::tts::{SpeechBuffer, Tts};
 use anyhow::{anyhow, bail, Context, Result};
 use crossbeam_channel::{unbounded, Receiver};
 use serde_json::{json, Value};
@@ -62,6 +63,10 @@ pub struct AcpConnection {
     auto_approve: bool,
     stream: Stream,
     color: bool,
+    /// Spoken output. Only reply text is routed here — never thoughts or tool
+    /// progress — and it is spoken sentence by sentence as the reply streams.
+    tts: Tts,
+    speech: SpeechBuffer,
 }
 
 impl AcpConnection {
@@ -70,7 +75,7 @@ impl AcpConnection {
     /// receiver the caller waits on. Keeping the receiver separate from the
     /// connection lets the supervisor `select!` on it while still holding
     /// `&mut AcpConnection` to handle each message.
-    pub fn connect(cmd: &[String], auto_approve: bool) -> Result<(Self, Receiver<Incoming>)> {
+    pub fn connect(cmd: &[String], auto_approve: bool, tts: Tts) -> Result<(Self, Receiver<Incoming>)> {
         anyhow::ensure!(!cmd.is_empty(), "agent command is empty");
         let mut child = Command::new(&cmd[0])
             .args(&cmd[1..])
@@ -91,6 +96,8 @@ impl AcpConnection {
             auto_approve,
             stream: Stream::Idle,
             color: std::io::stdout().is_terminal(),
+            tts,
+            speech: SpeechBuffer::default(),
         };
         c.handshake(&incoming)?;
         Ok((c, incoming))
@@ -159,6 +166,7 @@ impl AcpConnection {
         self.next_id += 1;
         self.active_prompt = Some(id);
         self.stream = Stream::Idle;
+        self.speech.reset();
         let session_id = self.session_id.clone();
         self.send(&json!({
             "jsonrpc": "2.0", "id": id, "method": "session/prompt",
@@ -217,6 +225,12 @@ impl AcpConnection {
                         .as_str()
                         .unwrap_or("end_turn")
                         .to_string();
+                    // Speak the tail of the reply (a last sentence without
+                    // final punctuation). A cancelled turn stays silent.
+                    match self.speech.flush() {
+                        Some(rest) if stop != "cancelled" => self.tts.say(rest),
+                        _ => {}
+                    }
                     return Some(stop);
                 }
                 return None;
@@ -239,6 +253,11 @@ impl AcpConnection {
                 if let Some(text) = update["content"]["text"].as_str() {
                     self.enter(Stream::Message, "");
                     self.out(text);
+                    // Reply text is the ONLY thing spoken; each sentence goes
+                    // out as soon as it is complete, not at end of turn.
+                    for sentence in self.speech.push(text) {
+                        self.tts.say(sentence);
+                    }
                 }
             }
             "agent_thought_chunk" => {

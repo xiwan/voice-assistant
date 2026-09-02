@@ -25,6 +25,7 @@ mod agent;
 mod asr;
 mod audio;
 mod setup;
+mod tts;
 mod vad;
 mod wakeword;
 
@@ -32,6 +33,8 @@ use agent::{AgentHandle, AgentState};
 use anyhow::Result;
 use crossbeam_channel::Receiver;
 use std::io::IsTerminal;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::time::Duration;
 use vad::VAD_CHUNK;
 
@@ -50,6 +53,8 @@ struct Config {
     agent_mode: String,
     /// Assistant persona name derived from the wake word (e.g. "Jarvis").
     persona: String,
+    /// Spoken-output engine (off / say).
+    tts_engine: tts::Engine,
     silence_ms: f32,
     no_speech_ms: f32,
     max_utterance_ms: f32,
@@ -80,6 +85,7 @@ impl Config {
             s => Some(s),
         };
         let models_dir = setup::models_dir();
+        let lang_for_tts = lang.clone();
         Ok(Self {
             wake_model: setup::wake_model_path(&settings).to_string_lossy().into_owned(),
             wake_display: setup::wake_display(&settings),
@@ -101,6 +107,14 @@ impl Config {
             auto_approve: settings.agent_mode == "full",
             agent_mode: settings.agent_mode.clone(),
             persona: setup::persona_name(&settings.wake_word),
+            tts_engine: tts::Engine::resolve(
+                &env("VA_TTS", &settings.tts),
+                &env("VA_TTS_VOICE", &settings.tts_voice),
+                env("VA_TTS_RATE", &settings.tts_rate.to_string())
+                    .parse()
+                    .unwrap_or(settings.tts_rate),
+                &lang_for_tts,
+            ),
             silence_ms: env("VA_SILENCE_MS", &settings.silence_ms.to_string())
                 .parse()
                 .unwrap_or(1000.0),
@@ -152,6 +166,7 @@ fn main() -> Result<()> {
         Some("test-wake") => test_wake(&cfg),
         Some("test-vad") => test_vad(&cfg),
         Some("test-asr") => test_asr(&cfg),
+        Some("test-tts") => test_tts(&cfg),
         Some("ask") => ask_cli(&cfg),
         Some("agent-test") => agent_test(&cfg),
         Some(other) => {
@@ -162,10 +177,17 @@ fn main() -> Result<()> {
     }
 }
 
-fn start_capture() -> Result<(audio::Capture, Receiver<Vec<i16>>)> {
+/// Start mic capture. `muted` is raised by the TTS player while it speaks, so
+/// the assistant never hears its own voice (half duplex).
+fn start_capture(muted: Arc<AtomicBool>) -> Result<(audio::Capture, Receiver<Vec<i16>>)> {
     let (tx, rx) = crossbeam_channel::bounded(256);
-    let cap = audio::Capture::start(tx)?;
+    let cap = audio::Capture::start(tx, muted)?;
     Ok((cap, rx))
+}
+
+/// Capture with no mute source (component test commands).
+fn start_capture_unmuted() -> Result<(audio::Capture, Receiver<Vec<i16>>)> {
+    start_capture(Arc::new(AtomicBool::new(false)))
 }
 
 /// For the kiro backend, regenerate ~/.kiro/agents/voice.json so the agent's
@@ -237,12 +259,18 @@ fn ask_cli(cfg: &Config) -> Result<()> {
     anyhow::ensure!(!prompts.is_empty(), "usage: voice-assistant ask <text> [more text...]");
     sync_persona(cfg);
     eprintln!("[acp] starting agent: {}", cfg.agent_cmd.join(" "));
-    let agent = AgentHandle::spawn(cfg.agent_cmd.clone(), cfg.auto_approve);
+    let speaker = tts::Tts::spawn(cfg.tts_engine.clone(), Arc::new(AtomicBool::new(false)));
+    let agent = AgentHandle::spawn(cfg.agent_cmd.clone(), cfg.auto_approve, speaker.clone());
     for (i, p) in prompts.iter().enumerate() {
         println!("\n>> [{}] {p}", i + 1);
         agent.prompt(p.clone());
         wait_for_idle(&agent);
     }
+    // Let the spoken tail finish before we tear everything down.
+    while speaker.is_speaking() {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    speaker.shutdown();
     agent.shutdown();
     Ok(())
 }
@@ -253,7 +281,8 @@ fn ask_cli(cfg: &Config) -> Result<()> {
 fn agent_test(cfg: &Config) -> Result<()> {
     sync_persona(cfg);
     eprintln!("[agent-test] launching: {}", cfg.agent_cmd.join(" "));
-    let agent = AgentHandle::spawn(cfg.agent_cmd.clone(), cfg.auto_approve);
+    let silent = tts::Tts::spawn(tts::Engine::Off, Arc::new(AtomicBool::new(false)));
+    let agent = AgentHandle::spawn(cfg.agent_cmd.clone(), cfg.auto_approve, silent);
 
     // Consume states until the next Idle, printing each transition. Returns the
     // stopReason, or None if the agent channel closed.
@@ -294,7 +323,15 @@ fn run(cfg: &Config) -> Result<()> {
     let mut wake = cfg.wakeword()?;
     let mut vad = cfg.vad()?;
     let asr = cfg.asr()?;
-    let (_cap, rx) = start_capture()?;
+
+    // Spoken replies. The player owns the `muted` flag that the audio callback
+    // honours, which is what keeps the assistant from hearing itself.
+    let muted = Arc::new(AtomicBool::new(false));
+    let speaker = tts::Tts::spawn(cfg.tts_engine.clone(), muted.clone());
+    if speaker.enabled() {
+        eprintln!("[tts] 语音回复已开启 ({:?})", cfg.tts_engine);
+    }
+    let (_cap, rx) = start_capture(muted)?;
 
     // Keep the managed kiro agent's identity in sync with the wake word.
     sync_persona(cfg);
@@ -303,7 +340,7 @@ fn run(cfg: &Config) -> Result<()> {
     // blocks on a reply, so it can always hear the wake word — including
     // "Jarvis, 停" to interrupt a running task. Exactly one agent is kept alive.
     eprintln!("[acp] starting agent: {}", cfg.agent_cmd.join(" "));
-    let agent = AgentHandle::spawn(cfg.agent_cmd.clone(), cfg.auto_approve);
+    let agent = AgentHandle::spawn(cfg.agent_cmd.clone(), cfg.auto_approve, speaker.clone());
 
     println!(
         "== voice assistant ready, say the wake word (\"{}\") ==",
@@ -337,10 +374,18 @@ fn run(cfg: &Config) -> Result<()> {
 
         if conv.followup {
             conv.followup = false;
+            // The reply is still being read out: let it finish before opening
+            // the window, otherwise the no-speech timer runs during speech.
+            drain_while_speaking(&rx, &speaker)?;
             vad.reset();
+            wake.reset();
             match record_utterance(&rx, &mut vad, cfg)? {
-                Some(audio) => handle_command(audio, &asr, &agent, &mut conv),
-                None => println!(">> {}: 好的，我先下线待机了，需要时再叫我。", cfg.persona),
+                Some(audio) => handle_command(audio, &asr, &agent, &speaker, &mut conv),
+                None => {
+                    let bye = "好的，我先下线待机了，需要时再叫我。";
+                    println!(">> {}: {bye}", cfg.persona);
+                    speaker.say(bye);
+                }
             }
             continue;
         }
@@ -356,13 +401,29 @@ fn run(cfg: &Config) -> Result<()> {
         }
         let hint = if conv.busy { "，打断中" } else { "" };
         println!("\x07>> wake word detected (score {score:.2}){hint}, listening...");
+        speaker.stop(); // stop talking the moment the user speaks up
         vad.reset();
         match record_utterance(&rx, &mut vad, cfg)? {
-            Some(audio) => handle_command(audio, &asr, &agent, &mut conv),
+            Some(audio) => handle_command(audio, &asr, &agent, &speaker, &mut conv),
             None => println!(">> 没听到指令，回到待机"),
         }
         wake.reset();
     }
+}
+
+/// Keep consuming (muted) audio until the assistant has finished speaking, so
+/// the capture queue doesn't back up and listening starts on a clean stream.
+fn drain_while_speaking(rx: &Receiver<Vec<i16>>, speaker: &tts::Tts) -> Result<()> {
+    while speaker.is_speaking() {
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(_) => {}
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                anyhow::bail!("audio capture stopped (input device gone?)")
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Conversation state for the main loop.
@@ -381,7 +442,13 @@ struct Conv {
 /// Transcribe an utterance and dispatch by intent: pause remembers the running
 /// task for later; resume re-launches it; abandon clears it; anything else is a
 /// new request (the supervisor auto-redirects if a turn is already running).
-fn handle_command(audio: Vec<i16>, asr: &asr::Asr, agent: &AgentHandle, conv: &mut Conv) {
+fn handle_command(
+    audio: Vec<i16>,
+    asr: &asr::Asr,
+    agent: &AgentHandle,
+    speaker: &tts::Tts,
+    conv: &mut Conv,
+) {
     let text = match asr.transcribe(&audio) {
         Ok(t) if t.is_empty() => {
             println!(">> 没听清，请再说一次");
@@ -394,6 +461,8 @@ fn handle_command(audio: Vec<i16>, asr: &asr::Asr, agent: &AgentHandle, conv: &m
         }
     };
     println!(">> you said: {text}");
+    // The user is talking to us: stop reading the previous answer out loud.
+    speaker.stop();
     match classify_intent(&text) {
         Intent::Pause => {
             if conv.busy {
@@ -566,7 +635,7 @@ fn selftest(cfg: &Config) -> Result<()> {
 
 fn test_wake(cfg: &Config) -> Result<()> {
     let mut wake = cfg.wakeword()?;
-    let (_cap, rx) = start_capture()?;
+    let (_cap, rx) = start_capture_unmuted()?;
     println!("say the wake word; scores > threshold are marked. Ctrl-C to quit.");
     loop {
         let chunk = rx.recv()?;
@@ -581,7 +650,7 @@ fn test_wake(cfg: &Config) -> Result<()> {
 
 fn test_vad(cfg: &Config) -> Result<()> {
     let mut vad = cfg.vad()?;
-    let (_cap, rx) = start_capture()?;
+    let (_cap, rx) = start_capture_unmuted()?;
     let mut pending: Vec<i16> = Vec::new();
     println!("speak; showing VAD probability per 32ms frame. Ctrl-C to quit.");
     loop {
@@ -599,7 +668,7 @@ fn test_vad(cfg: &Config) -> Result<()> {
 fn test_asr(cfg: &Config) -> Result<()> {
     let mut vad = cfg.vad()?;
     let asr = cfg.asr()?;
-    let (_cap, rx) = start_capture()?;
+    let (_cap, rx) = start_capture_unmuted()?;
     println!("speak now (recording until 1s of silence)...");
     match record_utterance(&rx, &mut vad, cfg)? {
         Some(audio) => {
@@ -609,6 +678,58 @@ fn test_asr(cfg: &Config) -> Result<()> {
         }
         None => println!("no speech detected"),
     }
+    Ok(())
+}
+
+/// TTS debug: feed a reply through the streaming buffer character by character,
+/// exactly as it would arrive from the agent, and speak it. Shows that speech
+/// starts at the first finished sentence (not at the end of the reply), that
+/// code blocks are skipped, and — with `--interrupt` — that "停" cuts it off.
+fn test_tts(cfg: &Config) -> Result<()> {
+    anyhow::ensure!(
+        cfg.tts_engine.enabled(),
+        "语音回复当前关闭，先运行 `voice-assistant setup` 打开 (或设 VA_TTS=say)"
+    );
+    let args: Vec<String> = std::env::args().skip(2).collect();
+    let interrupt = args.iter().any(|a| a == "--interrupt");
+    let custom: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
+    let reply = if custom.is_empty() {
+        "好的，我看了一下代码。问题出在音频回调里，播放的时候麦克风还在听。\n\
+         ```rust\nlet _ = tx.try_send(out); // 这句不该在静音时执行\n```\n\
+         修好了，现在播放期间会把输入通道静音，所以不会再自己听自己说话了。"
+            .to_string()
+    } else {
+        custom.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(" ")
+    };
+
+    let muted = Arc::new(AtomicBool::new(false));
+    let speaker = tts::Tts::spawn(cfg.tts_engine.clone(), muted);
+    let mut buf = tts::SpeechBuffer::default();
+    println!("[tts] engine {:?}", cfg.tts_engine);
+    // Simulate streaming: one char at a time, ~25ms apart.
+    for ch in reply.chars() {
+        for sentence in buf.push(&ch.to_string()) {
+            println!("  ♪ {sentence}");
+            speaker.say(sentence);
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    if let Some(rest) = buf.flush() {
+        println!("  ♪ {rest}");
+        speaker.say(rest);
+    }
+    if interrupt {
+        std::thread::sleep(Duration::from_millis(1500));
+        println!("  ⏹  模拟用户说“停”");
+        speaker.stop();
+        std::thread::sleep(Duration::from_millis(300));
+        println!("  speaking = {} (应为 false)", speaker.is_speaking());
+    }
+    while speaker.is_speaking() {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    speaker.shutdown();
+    println!("[tts] done");
     Ok(())
 }
 
