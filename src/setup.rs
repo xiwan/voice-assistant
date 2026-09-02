@@ -53,12 +53,15 @@ pub struct Settings {
     pub no_speech_ms: u32,
     /// Hard cap on a single utterance.
     pub max_utterance_ms: u32,
-    /// Spoken replies: "off" or "say" (macOS `say`).
+    /// Spoken replies: "off", "say" (macOS `say`), or "cmd" (external sidecar).
     pub tts: String,
     /// Voice name for the engine; empty = pick by language (zh -> Tingting).
     pub tts_voice: String,
     /// Words per minute; 0 = engine default.
     pub tts_rate: u32,
+    /// Sidecar command for tts="cmd": reads reply text on stdin, synthesizes
+    /// and plays it, exits when done (e.g. a Kokoro/Piper wrapper).
+    pub tts_cmd: String,
 }
 
 impl Default for Settings {
@@ -76,6 +79,7 @@ impl Default for Settings {
             tts: if cfg!(target_os = "macos") { "say".into() } else { "off".into() },
             tts_voice: String::new(),
             tts_rate: 0,
+            tts_cmd: String::new(),
         }
     }
 }
@@ -130,6 +134,7 @@ pub fn load() -> Option<Settings> {
             "tts" => s.tts = v.into(),
             "tts_voice" => s.tts_voice = v.into(),
             "tts_rate" => s.tts_rate = v.parse().unwrap_or(0),
+            "tts_cmd" => s.tts_cmd = v.into(),
             _ => {}
         }
     }
@@ -143,7 +148,7 @@ pub fn save(s: &Settings) -> Result<()> {
         format!(
             "wake_word={}\nlang={}\nwhisper={}\nthreshold={}\nagent_cmd={}\n\
              agent_mode={}\nsilence_ms={}\nno_speech_ms={}\nmax_utterance_ms={}\n\
-             tts={}\ntts_voice={}\ntts_rate={}\n",
+             tts={}\ntts_voice={}\ntts_rate={}\ntts_cmd={}\n",
             s.wake_word,
             s.lang,
             s.whisper,
@@ -155,7 +160,8 @@ pub fn save(s: &Settings) -> Result<()> {
             s.max_utterance_ms,
             s.tts,
             s.tts_voice,
-            s.tts_rate
+            s.tts_rate,
+            s.tts_cmd
         ),
     )?;
     Ok(())
@@ -271,16 +277,40 @@ pub fn interactive_setup(existing: Option<Settings>) -> Result<Settings> {
     println!("\n5) 语音回复 (把回答念出来):");
     println!("   1. 开   (macOS 内置 say, 边生成边念)");
     println!("   2. 关   (只在终端显示文字)");
-    let cur_tts_on = cur.tts != "off";
-    let tchoice = ask("语音回复", if cur_tts_on { "1" } else { "2" });
-    let (tts, tts_voice, tts_rate) = if tchoice.trim() == "2" {
-        ("off".to_string(), cur.tts_voice.clone(), cur.tts_rate)
-    } else {
-        let v = ask("音色 (留空=按语言自动, 中文用 Tingting; `say -v ?` 看全部)", &cur.tts_voice);
-        let r = ask("语速 (字/分钟, 0=默认)", &cur.tts_rate.to_string())
-            .parse()
-            .unwrap_or(cur.tts_rate);
-        ("say".to_string(), v, r)
+    println!("   3. 自定义命令 (外部 TTS sidecar, 如 Kokoro/Piper: 从 stdin 读文本, 自己合成并播放)");
+    let cur_tts_idx = match cur.tts.as_str() {
+        "off" => "2",
+        "cmd" => "3",
+        _ => "1",
+    };
+    let tchoice = ask("语音回复", cur_tts_idx);
+    let (tts, tts_voice, tts_rate, tts_cmd) = match tchoice.trim() {
+        "2" => (
+            "off".to_string(),
+            cur.tts_voice.clone(),
+            cur.tts_rate,
+            cur.tts_cmd.clone(),
+        ),
+        "3" => {
+            let c = ask(
+                "TTS 命令 (从 stdin 读文本, 自己合成+播放, 单进程可 kill)",
+                &cur.tts_cmd,
+            );
+            anyhow::ensure!(!c.trim().is_empty(), "TTS 命令不能为空");
+            if let Some(bin) = c.split_whitespace().next() {
+                if !which_on_path(bin) {
+                    println!("   ⚠️  未在 PATH 找到 '{bin}'，请确认已安装 (仍会保存)");
+                }
+            }
+            ("cmd".to_string(), cur.tts_voice.clone(), cur.tts_rate, c)
+        }
+        _ => {
+            let v = ask("音色 (留空=按语言自动, 中文用 Tingting; `say -v ?` 看全部)", &cur.tts_voice);
+            let r = ask("语速 (字/分钟, 0=默认)", &cur.tts_rate.to_string())
+                .parse()
+                .unwrap_or(cur.tts_rate);
+            ("say".to_string(), v, r, cur.tts_cmd.clone())
+        }
     };
 
     // 6) Runtime tuning. Enter keeps the current value.
@@ -311,6 +341,7 @@ pub fn interactive_setup(existing: Option<Settings>) -> Result<Settings> {
         tts,
         tts_voice,
         tts_rate,
+        tts_cmd,
     };
     save(&settings)?;
     println!("\n已保存到 {} (随时可用 `voice-assistant setup` 修改)\n", config_path().display());

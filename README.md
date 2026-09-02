@@ -101,9 +101,10 @@ cargo build --release
 | `threshold` | `VA_WAKE_THRESHOLD` | 0.5 | 唤醒词检测阈值 |
 | `agent_mode` | — | readonly | kiro 权限：readonly / safe / full |
 | `agent_cmd` | `VA_AGENT_CMD` | kiro-cli acp --agent voice | ACP agent 启动命令（换后端只改这里） |
-| `tts` | `VA_TTS` | say (macOS) / off | 语音回复引擎：say / off |
+| `tts` | `VA_TTS` | say (macOS) / off | 语音回复引擎：say / cmd / off |
 | `tts_voice` | `VA_TTS_VOICE` | 自动 | 音色，留空则按语言选（zh → Tingting） |
 | `tts_rate` | `VA_TTS_RATE` | 0 | 语速（字/分钟），0 = 引擎默认 |
+| `tts_cmd` | `VA_TTS_CMD` | — | tts=cmd 时的 sidecar 命令（从 stdin 读文本、自己合成并播放）|
 | `silence_ms` | `VA_SILENCE_MS` | 1000 | 说完停顿多久算结束 |
 | `no_speech_ms` | `VA_NO_SPEECH_MS` | 6000 | 唤醒后 / 追问窗口内不说话多久放弃（超时播报下线） |
 | `max_utterance_ms` | `VA_MAX_UTTERANCE_MS` | 30000 | 单次录音上限 |
@@ -125,13 +126,22 @@ setup 第 5 步开关，默认在 macOS 上开启，引擎是系统内置的 `sa
   48 字还没标点，会在逗号处先切一段出来念，所以开口时机跟着生成走，不用等整段写完。
 - **只念该念的**：只有回答正文进 TTS。思考过程、工具调用、代码块、表格、分隔线一律
   跳过，行内的 markdown 标记会去掉，URL 念成"链接"。
-- **半双工**：播放期间麦克风输入被静音，否则助手会听见自己的声音并当成新指令（死循环）。
-  代价是**朗读过程中没法用语音打断**——想插话就等这句念完，或者按 Ctrl-C。念完 250ms
-  后自动恢复收音（留一点时间让房间回声散掉）。
-- 你一开口下新指令，正在念的内容会立刻掐掉（`say` 进程被 kill）。
+- **朗读中可打断**：麦克风始终实时监听，念回答时喊"（唤醒词）停/暂停"即可掐断（`say`
+  进程被 kill），说新指令也会立刻改做新的。戴耳机最稳；外放且无 AEC 时，助手的声音会
+  混进麦克风，可能影响唤醒识别（下一步 Kokoro sidecar + 回声消除解决）。
+- 回答刚生成完、还在念最后一句的那段"尾巴"里暂不响应唤醒打断，等这句念完即进入追问窗口。
 
-音色用 `say -v '?'` 看全部；中文默认 Tingting。换引擎只需要加一个 `Engine` 实现，
-流水线代码不用动——Piper（本地神经 TTS，音质更好）就是按这条路加进来的下一步。
+音色用 `say -v '?'` 看全部；中文默认 Tingting。若嫌 `say` 中文音质一般，setup 里可先
+换 macOS **增强中文音色**（系统设置 → 辅助功能 → 朗读内容 → 系统嗓音 → 管理嗓音）。
+
+#### 换更好的引擎：`tts=cmd` sidecar
+
+想要更自然的中文（如 **Kokoro** 神经 TTS）时，用 `cmd` 引擎：setup 第 5 步选"自定义
+命令"，或设 `VA_TTS=cmd` + `VA_TTS_CMD="python3 /abs/path/scripts/kokoro_say.py"`。
+约定很简单——sidecar **从 stdin 读一句文本、自己合成并播放、放完退出**（单进程，这样
+"停"能把它 kill 掉打断）。因为是独立进程，Kokoro 自带的 onnxruntime 不会和本程序钉死的
+`ort` 版本冲突。参考实现见 `scripts/kokoro_say.py`（需 `pip install kokoro-onnx
+misaki[zh] sounddevice` 并下载中文模型）。同理可接 Piper 或任何别的 TTS。
 
 ### Agent 后端
 
@@ -170,16 +180,17 @@ setup 重设或每次启动都会按当前唤醒词/权限重写，请勿手改�
 - **没有输入设备**：确认终端有麦克风权限；`voice-assistant devices` 列出设备
 - **中文识别差**：`setup` 换 small/medium 模型
 - **听不到语音回复**：`voice-assistant test-tts` 直接试；确认 `tts=say`（Linux 暂无内置引擎）
-- **助手把自己的话当指令**：播放期间本应自动静音；若仍复发，说明外放音量过大导致
-  静音尾巴（250ms）不够，先调低音量或改用耳机
+- **助手把自己的话当指令**：麦克风现在全程实时监听（为支持朗读中打断），只对唤醒词响应；
+  外放且无 AEC 时若被自身声音误触，戴耳机可根治，或临时把 `tts` 调低音量/关掉
 - **agent 响应慢**：默认走 `kiro-cli acp --agent voice`（ACP 常驻进程，无 MCP 冷启动、多轮不重启）；`setup` 会自动配置
 - **模型下载慢/失败**：`VA_HF_BASE` 换源，或手动下载放入模型目录
 
 ## Roadmap
 
-- [x] TTS 语音回复 — 流式按句朗读，macOS `say`（半双工，播放时静音麦克风）
-- [ ] Piper 本地神经 TTS（音质升级，接口已抽好，只需加一个 `Engine` 实现）
-- [ ] 朗读时也能语音打断（需要 AEC 或唤醒词专用旁路，当前是半双工）
+- [x] TTS 语音回复 — 流式按句朗读，macOS `say`
+- [x] 朗读中语音打断 — 麦克风实时监听，唤醒词旁路（外放全双工需 AEC，见下）
+- [x] 可换 TTS 引擎 — `tts=cmd` sidecar（接 Kokoro/Piper 等，独立进程绕开 ort 冲突）
+- [ ] Kokoro 中文神经 TTS 参考 sidecar 打磨 + 外放回声消除（AEC，用自合成信号做参考）
 - [x] 会话连续性（多轮对话保持上下文）— 通过常驻 ACP agent 实现
 - [ ] 更多 agent 后端（ACP 通用协议，改 `agent_cmd` 即可接入其它 ACP agent）
 - [ ] 中文自定义唤醒词

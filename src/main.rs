@@ -113,6 +113,7 @@ impl Config {
                 env("VA_TTS_RATE", &settings.tts_rate.to_string())
                     .parse()
                     .unwrap_or(settings.tts_rate),
+                &env("VA_TTS_CMD", &settings.tts_cmd),
                 &lang_for_tts,
             ),
             silence_ms: env("VA_SILENCE_MS", &settings.silence_ms.to_string())

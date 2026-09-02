@@ -24,6 +24,7 @@
 use anyhow::{anyhow, Result};
 use crossbeam_channel::{unbounded, Receiver, RecvTimeoutError, Sender};
 use std::collections::VecDeque;
+use std::io::Write;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -49,12 +50,20 @@ pub enum Engine {
     Off,
     /// macOS `say`. Zero dependencies, mediocre voice — the bootstrap engine.
     Say { voice: Option<String>, rate: Option<u32> },
+    /// External sidecar: `argv` is spawned, the reply text is written to its
+    /// stdin, and it synthesizes AND plays the audio itself (like `say`). This
+    /// is how neural engines (Kokoro/Piper) plug in WITHOUT linking their own
+    /// onnx runtime into this binary — the ort version conflict is sidestepped
+    /// by running them as a separate process. The sidecar must be a single
+    /// process that plays then exits, so killing it stops playback (for 停 /
+    /// barge-in).
+    Cmd { argv: Vec<String> },
 }
 
 impl Engine {
     /// Resolve the configured engine id into an engine, picking a sensible
     /// default voice for the ASR language when none was configured.
-    pub fn resolve(id: &str, voice: &str, rate: u32, lang: &str) -> Self {
+    pub fn resolve(id: &str, voice: &str, rate: u32, cmd: &str, lang: &str) -> Self {
         match id {
             "say" => {
                 let voice = match voice.trim() {
@@ -65,6 +74,14 @@ impl Engine {
                 Engine::Say {
                     voice,
                     rate: (rate > 0).then_some(rate),
+                }
+            }
+            "cmd" => {
+                let argv: Vec<String> = cmd.split_whitespace().map(String::from).collect();
+                if argv.is_empty() {
+                    Engine::Off
+                } else {
+                    Engine::Cmd { argv }
                 }
             }
             _ => Engine::Off,
@@ -101,6 +118,23 @@ impl Engine {
                     .stderr(Stdio::null())
                     .spawn()
                     .map_err(|e| anyhow!("failed to run `say`: {e}"))
+            }
+            Engine::Cmd { argv } => {
+                // Spawn the sidecar and feed it the text on stdin; it does its
+                // own synthesis + playback and exits when done.
+                let mut child = Command::new(&argv[0])
+                    .args(&argv[1..])
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .map_err(|e| anyhow!("failed to run tts cmd `{}`: {e}", argv.join(" ")))?;
+                if let Some(mut stdin) = child.stdin.take() {
+                    let _ = stdin.write_all(text.as_bytes());
+                    // stdin dropped here -> EOF, so the sidecar reads the whole
+                    // utterance then synthesizes and plays it.
+                }
+                Ok(child)
             }
         }
     }
@@ -499,13 +533,25 @@ mod tests {
 
     #[test]
     fn engine_resolves_chinese_voice_by_default() {
-        match Engine::resolve("say", "", 0, "zh") {
+        match Engine::resolve("say", "", 0, "", "zh") {
             Engine::Say { voice, rate } => {
                 assert_eq!(voice.as_deref(), Some("Tingting"));
                 assert!(rate.is_none());
             }
             e => panic!("unexpected engine {e:?}"),
         }
-        assert!(!Engine::resolve("off", "", 0, "zh").enabled());
+        assert!(!Engine::resolve("off", "", 0, "", "zh").enabled());
+    }
+
+    #[test]
+    fn cmd_engine_parses_argv() {
+        match Engine::resolve("cmd", "", 0, "python3 kokoro_say.py --zh", "zh") {
+            Engine::Cmd { argv } => {
+                assert_eq!(argv, vec!["python3", "kokoro_say.py", "--zh"]);
+            }
+            e => panic!("unexpected engine {e:?}"),
+        }
+        // Empty command -> disabled (never mutes / never spawns).
+        assert!(!Engine::resolve("cmd", "", 0, "   ", "zh").enabled());
     }
 }
