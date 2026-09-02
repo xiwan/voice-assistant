@@ -85,6 +85,20 @@ fn config_path() -> PathBuf {
     base_dir().join("config")
 }
 
+/// Whether `bin` resolves to an existing file (absolute/relative path) or is
+/// found on $PATH. Unix-only lookup, which matches this project's targets.
+fn which_on_path(bin: &str) -> bool {
+    if bin.contains('/') {
+        return PathBuf::from(bin).exists();
+    }
+    std::env::var("PATH")
+        .map(|path| {
+            path.split(':')
+                .any(|dir| PathBuf::from(dir).join(bin).exists())
+        })
+        .unwrap_or(false)
+}
+
 /// Load persisted settings, if a config file exists.
 pub fn load() -> Option<Settings> {
     let text = fs::read_to_string(config_path()).ok()?;
@@ -189,45 +203,78 @@ pub fn interactive_setup(existing: Option<Settings>) -> Result<Settings> {
         _ => wchoice,
     };
 
-    println!("\n4) kiro-cli 权限 (语音指令允许 kiro 做什么):");
-    for (i, (_, desc)) in AGENT_MODES.iter().enumerate() {
-        println!("   {}. {desc}", i + 1);
-    }
-    let cur_midx = AGENT_MODES
-        .iter()
-        .position(|(id, _)| *id == cur.agent_mode)
-        .map(|i| i + 1)
-        .unwrap_or(1);
-    let mchoice = ask("权限编号", &cur_midx.to_string());
-    let agent_mode = match mchoice.parse::<usize>() {
-        Ok(n) if n >= 1 && n <= AGENT_MODES.len() => AGENT_MODES[n - 1].0.to_string(),
-        _ => mchoice,
-    };
+    // 4) Agent backend. ACP is agent-agnostic, so besides kiro-cli the user
+    //    can point voice-assistant at any other ACP-speaking agent on this box.
+    println!("\n4) Agent 后端 (通过 ACP 协议对接):");
+    println!("   1. kiro-cli            (默认, 自动管理权限)");
+    println!("   2. 自定义 ACP 命令     (本机其它 agent, 手填启动命令)");
+    let cur_is_kiro = cur.agent_cmd.is_empty() || cur.agent_cmd.starts_with("kiro-cli");
+    let bchoice = ask("后端编号", if cur_is_kiro { "1" } else { "2" });
 
-    // Generate the managed kiro-cli agent and route calls through it over ACP.
-    write_agent_config(&agent_mode)?;
-    // Launch command for the persistent ACP agent. "full" mode adds -a so the
-    // agent auto-approves tool use (voice can't do interactive confirmations).
-    let agent_cmd = if cur.agent_cmd.is_empty() || cur.agent_cmd.starts_with("kiro-cli") {
+    let (agent_cmd, agent_mode) = if bchoice.trim() == "2" {
+        // Custom ACP backend: user supplies the full launch command.
+        let cmd = ask("完整启动命令 (例: my-agent acp)", &cur.agent_cmd);
+        anyhow::ensure!(!cmd.trim().is_empty(), "启动命令不能为空");
+        if let Some(bin) = cmd.split_whitespace().next() {
+            if !which_on_path(bin) {
+                println!("   ⚠️  未在 PATH 找到 '{bin}'，请确认已安装 (仍会保存)");
+            }
+        }
+        // Voice has no interactive confirmation, so decide tool-approval upfront.
+        // We reuse the "full" mode marker to drive auto-approve in the client.
+        let approve = ask("自动批准工具授权? (语音无法交互确认) [y/N]", "N");
+        let mode = if approve.eq_ignore_ascii_case("y") { "full" } else { "safe" };
+        (cmd, mode.to_string())
+    } else {
+        // kiro-cli: pick a permission mode and generate the managed agent file.
+        println!("\n   kiro-cli 权限 (语音指令允许 kiro 做什么):");
+        for (i, (_, desc)) in AGENT_MODES.iter().enumerate() {
+            println!("     {}. {desc}", i + 1);
+        }
+        let cur_midx = AGENT_MODES
+            .iter()
+            .position(|(id, _)| *id == cur.agent_mode)
+            .map(|i| i + 1)
+            .unwrap_or(1);
+        let mchoice = ask("权限编号", &cur_midx.to_string());
+        let mode = match mchoice.parse::<usize>() {
+            Ok(n) if n >= 1 && n <= AGENT_MODES.len() => AGENT_MODES[n - 1].0.to_string(),
+            _ => mchoice,
+        };
+        write_agent_config(&mode)?;
+        // "full" adds -a so the agent auto-approves tool use.
         let mut c = "kiro-cli acp --agent voice".to_string();
-        if agent_mode == "full" {
+        if mode == "full" {
             c.push_str(" -a");
         }
-        c
-    } else {
-        cur.agent_cmd // user configured a custom (non-kiro) ACP backend; keep it
+        (c, mode)
     };
+
+    // 5) Runtime tuning. Enter keeps the current value.
+    println!("\n5) 运行参数 (回车保留当前值):");
+    let threshold = ask("唤醒阈值 (0-1, 越低越灵敏)", &cur.threshold.to_string())
+        .parse()
+        .unwrap_or(cur.threshold);
+    let silence_ms = ask("说完停顿多久算结束 (ms)", &cur.silence_ms.to_string())
+        .parse()
+        .unwrap_or(cur.silence_ms);
+    let no_speech_ms = ask("唤醒后多久没开口就放弃 (ms)", &cur.no_speech_ms.to_string())
+        .parse()
+        .unwrap_or(cur.no_speech_ms);
+    let max_utterance_ms = ask("单次录音上限 (ms)", &cur.max_utterance_ms.to_string())
+        .parse()
+        .unwrap_or(cur.max_utterance_ms);
 
     let settings = Settings {
         wake_word,
         lang,
         whisper,
-        threshold: cur.threshold,
+        threshold,
         agent_cmd,
         agent_mode,
-        silence_ms: cur.silence_ms,
-        no_speech_ms: cur.no_speech_ms,
-        max_utterance_ms: cur.max_utterance_ms,
+        silence_ms,
+        no_speech_ms,
+        max_utterance_ms,
     };
     save(&settings)?;
     println!("\n已保存到 {} (随时可用 `voice-assistant setup` 修改)\n", config_path().display());

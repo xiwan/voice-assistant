@@ -49,7 +49,7 @@ cargo build --release
 | 命令 | 说明 |
 |------|------|
 | `voice-assistant` | 运行完整流水线（首次自动进入 setup） |
-| `voice-assistant setup` | 重新设置：唤醒词 / 语言 / whisper 模型 / kiro 权限 |
+| `voice-assistant setup` | 重新设置：唤醒词 / 语言 / whisper 模型 / agent 后端 / 运行参数 |
 | `voice-assistant devices` | 列出音频输入设备 |
 | `voice-assistant test-wake` | 唤醒词调试：实时打印检测得分 |
 | `voice-assistant test-vad` | VAD 调试：实时打印语音概率 |
@@ -80,6 +80,13 @@ cargo build --release
 
 内置四个 openWakeWord 预训练唤醒词：Hey Jarvis / Alexa / Hey Mycroft / Hey Rhasspy。
 也可以在 setup 中填入自己[训练的 openWakeWord 模型](https://github.com/dscripka/openWakeWord#training-new-models)（.onnx 路径）。
+
+### Agent 后端
+
+setup 第 4 步选择后端：默认 **kiro-cli**（自动生成并管理权限文件），也可选
+**自定义 ACP 命令**，填入本机任意会说 ACP 的 agent 启动命令（例如 `my-agent acp`）。
+ACP 是通用协议，切换后端不需要改代码。自定义后端会询问是否自动批准工具授权（语音
+场景无法交互确认），也可随时直接编辑 config 里的 `agent_cmd`。
 
 ### kiro-cli 权限模式
 
