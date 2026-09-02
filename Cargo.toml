@@ -1,0 +1,21 @@
+[package]
+name = "voice-assistant"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+cpal = "0.15"
+crossbeam-channel = "0.5"
+ort = "=2.0.0-rc.9"
+ort-sys = "=2.0.0-rc.9"
+ureq = "2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+whisper-rs = { version = "0.14", features = ["metal", "log_backend"] }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+whisper-rs = { version = "0.14", features = ["log_backend"] }
+
+[profile.release]
+lto = "thin"
