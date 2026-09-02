@@ -280,8 +280,9 @@ fn run(cfg: &Config) -> Result<()> {
     let mut followup = false;
 
     loop {
-        // Absorb agent state without blocking: a finished turn arms a follow-up
-        // window; a restart is announced.
+        // Drain agent state without blocking: a finished turn arms a follow-up
+        // window; a restart is announced. (Audio is continuous, so state sent
+        // while we're parked on recv() below is picked up within milliseconds.)
         for st in agent.state_rx.try_iter() {
             match st {
                 AgentState::Busy => busy = true,
@@ -311,30 +312,23 @@ fn run(cfg: &Config) -> Result<()> {
             continue;
         }
 
-        // Wake-word gate. `recv_timeout` so we periodically re-check agent
-        // state instead of blocking forever on audio.
-        match rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(chunk) => {
-                let Some(score) = wake.feed(&chunk)? else {
-                    continue;
-                };
-                if score < cfg.wake_threshold {
-                    continue;
-                }
-                let hint = if busy { "，打断中" } else { "" };
-                println!("\x07>> wake word detected (score {score:.2}){hint}, listening...");
-                vad.reset();
-                match record_utterance(&rx, &mut vad, cfg)? {
-                    Some(audio) => handle_command(audio, &asr, &agent, &mut busy),
-                    None => println!(">> 没听到指令，回到待机"),
-                }
-                wake.reset();
-            }
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                anyhow::bail!("audio capture stopped (input device gone?)")
-            }
+        // Wake-word gate. Block on audio exactly like the proven pipeline so the
+        // streaming detector is fed a continuous, gap-free stream.
+        let chunk = rx.recv()?;
+        let Some(score) = wake.feed(&chunk)? else {
+            continue;
+        };
+        if score < cfg.wake_threshold {
+            continue;
         }
+        let hint = if busy { "，打断中" } else { "" };
+        println!("\x07>> wake word detected (score {score:.2}){hint}, listening...");
+        vad.reset();
+        match record_utterance(&rx, &mut vad, cfg)? {
+            Some(audio) => handle_command(audio, &asr, &agent, &mut busy),
+            None => println!(">> 没听到指令，回到待机"),
+        }
+        wake.reset();
     }
 }
 
