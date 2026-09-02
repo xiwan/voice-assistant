@@ -7,7 +7,7 @@
 use anyhow::{anyhow, Context, Result};
 use std::fs;
 use std::io::{BufRead, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Pretrained openWakeWord models: (id, display name).
 pub const WAKE_WORDS: &[(&str, &str)] = &[
@@ -147,12 +147,15 @@ fn config_path() -> PathBuf {
 /// that an executable is `foo.exe` / `foo.cmd` rather than bare `foo`.
 pub fn which_on_path(bin: &str) -> bool {
     let path = std::env::var("PATH").unwrap_or_default();
-    which_in(bin, &path, cfg!(target_os = "windows"))
+    which_in(bin, &path, cfg!(target_os = "windows"), |p| p.exists())
 }
 
-fn which_in(bin: &str, path: &str, windows: bool) -> bool {
+/// Platform *and* filesystem are parameters, not ambient facts, so the Windows
+/// behaviour can be tested from macOS and the tests don't depend on which files
+/// happen to exist on the machine running them.
+fn which_in(bin: &str, path: &str, windows: bool, exists: impl Fn(&Path) -> bool) -> bool {
     if bin.contains('/') || (windows && bin.contains('\\')) {
-        return PathBuf::from(bin).exists();
+        return exists(Path::new(bin));
     }
     let sep = if windows { ';' } else { ':' };
     let candidates: Vec<String> = if windows {
@@ -162,7 +165,7 @@ fn which_in(bin: &str, path: &str, windows: bool) -> bool {
     };
     path.split(sep)
         .filter(|d| !d.is_empty())
-        .any(|dir| candidates.iter().any(|c| PathBuf::from(dir).join(c).exists()))
+        .any(|dir| candidates.iter().any(|c| exists(&PathBuf::from(dir).join(c))))
 }
 
 /// Load persisted settings, if a config file exists.
@@ -620,18 +623,52 @@ mod tests {
         assert_eq!(home_from(env(&[])), PathBuf::from("."));
     }
 
+    /// A fake filesystem: only these paths exist. Separators are compared
+    /// loosely on purpose — `PathBuf::join` inserts the *host's* separator, so
+    /// on this Mac joining `C:\tools` with `agent.exe` yields
+    /// `C:\tools/agent.exe`. The Windows semantics under test are the PATH
+    /// splitting and the suffix search, not how std spells a path.
+    fn fs<'a>(paths: &'a [&'a str]) -> impl Fn(&Path) -> bool + 'a {
+        move |p| {
+            let probe = p.to_string_lossy().replace('\\', "/");
+            paths.iter().any(|f| f.replace('\\', "/") == probe)
+        }
+    }
+
     #[test]
     fn path_lookup_uses_the_platform_separator() {
-        // A directory that certainly exists on the unix side of the test host.
         let unix_path = "/nonexistent:/usr/bin";
-        assert!(which_in("env", unix_path, false));
-        // With ';' assumed, the whole string is one bogus directory.
-        assert!(!which_in("env", unix_path, true));
+        let there = fs(&["/usr/bin/env"]);
+        assert!(which_in("env", unix_path, false, &there));
+        // With ';' assumed, the whole string is one bogus directory name.
+        assert!(!which_in("env", unix_path, true, &there));
+    }
+
+    #[test]
+    fn windows_path_lookup_splits_on_semicolons() {
+        let win_path = r"C:\nope;C:\tools";
+        let there = fs(&[r"C:\tools\kiro-cli.exe"]);
+        assert!(which_in("kiro-cli", win_path, true, &there));
+        // On the unix side that string is a single directory, so nothing matches.
+        assert!(!which_in("kiro-cli", win_path, false, &there));
+    }
+
+    /// `foo` on Windows is really `foo.exe`; without the suffix search every
+    /// lookup failed and setup reported installed tools as missing.
+    #[test]
+    fn windows_tries_executable_suffixes() {
+        let path = r"C:\tools";
+        assert!(which_in("agent", path, true, fs(&[r"C:\tools\agent.exe"])));
+        assert!(which_in("agent", path, true, fs(&[r"C:\tools\agent.cmd"])));
+        assert!(which_in("agent", path, true, fs(&[r"C:\tools\agent.bat"])));
+        assert!(!which_in("agent", path, true, fs(&[r"C:\tools\agent.txt"])));
     }
 
     #[test]
     fn explicit_paths_are_checked_directly() {
-        assert!(which_in("/usr/bin/env", "", false));
-        assert!(!which_in("/definitely/not/here", "", false));
+        // A path with a separator bypasses PATH entirely.
+        assert!(which_in("/opt/x/agent", "", false, fs(&["/opt/x/agent"])));
+        assert!(!which_in("/opt/x/agent", "", false, fs(&[])));
+        assert!(which_in(r"C:\x\agent.exe", "", true, fs(&[r"C:\x\agent.exe"])));
     }
 }
