@@ -1,12 +1,22 @@
 [package]
 name = "voice-assistant"
-version = "0.11.1"
+version = "0.12.0"
 edition = "2021"
 
 [dependencies]
 anyhow = "1"
 cpal = "0.15"
 crossbeam-channel = "0.5"
+# Desktop window (v0.12.0). default-features is off on purpose: the default set
+# pulls the wgpu backend, persistence (ron/serde), image loaders and an accesskit
+# stack that this app does not use. `glow` (OpenGL) links smaller and works on
+# older Windows/Linux GPUs; `default_fonts` is kept for the Latin glyphs — CJK
+# still has to come from a system font, egui ships none.
+#
+# NOTE: this file is a Protected File because `ort`/`ort-sys` must both stay
+# pinned at =2.0.0-rc.9 (pre-release semver otherwise resolves ort-sys to rc.10
+# and the build breaks). Verify with `cargo tree -i ort-sys` after any change here.
+eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts"] }
 ort = "=2.0.0-rc.9"
 ort-sys = "=2.0.0-rc.9"
 serde_json = "1"

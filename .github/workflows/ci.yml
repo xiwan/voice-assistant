@@ -29,12 +29,15 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      # cpal needs ALSA headers on Linux; whisper.cpp needs cmake everywhere.
+      # cpal needs ALSA headers; whisper.cpp needs cmake; the rest is the list
+      # eframe's own README requires on Linux (xcb/xkbcommon for winit, ssl).
       - name: Linux system deps
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake libasound2-dev pkg-config
+          sudo apt-get install -y cmake pkg-config libasound2-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libxkbcommon-dev libssl-dev
 
       - name: Check cmake is present
         run: cmake --version

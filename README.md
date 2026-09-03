@@ -67,6 +67,25 @@ cargo build --release
 继续对话（无需再念唤醒词，共享同一会话上下文）；`no_speech_ms` 内没开口，助手会
 播报一句下线提示并回到等唤醒词状态。
 
+### 桌面窗口
+
+```bash
+voice-assistant gui
+```
+
+跟终端模式跑的是**同一条流水线**——窗口只是订阅了同一份事件流的另一个前端，语音和界面
+按钮走同一条派发路径，不会出现两套行为。窗口里能看到：
+
+- 状态灯（待机 / 在听 / 思考中 / 重启中）和当前唤醒词
+- 唤醒得分条 + 阈值刻度：每个音频窗口都画，阈值设得不对一眼就看出来
+- 对话流：你说的话、流式生成的回答；思考过程和工具调用默认折叠，勾选后展开
+- 暂停 / 继续 / 放弃三个按钮，和说"暂停/继续/算了"完全等价
+- 输入框：不方便说话时直接打字
+
+用 egui + glow（OpenGL）而不是 Tauri：不引入 WebView，三平台一份代码。egui 自带字体
+不含中文，程序会自动探测系统中文字体（macOS Hiragino/PingFang、Windows 微软雅黑、
+Linux Noto Sans CJK / 文泉驿）；都找不到时会提示，界面中文会显示为方块。
+
 ### 打断与继续
 
 任务执行中主循环一直在听，念唤醒词即可插话，按你说的话分流：
@@ -86,6 +105,7 @@ cargo build --release
 | 命令 | 说明 |
 |------|------|
 | `voice-assistant` | 运行完整流水线（首次自动进入 setup） |
+| `voice-assistant gui` | 桌面窗口（同一条流水线，多一个可见的界面） |
 | `voice-assistant setup` | 重新设置：唤醒词 / 语言 / whisper 模型 / agent 后端 / 运行参数 |
 | `voice-assistant devices` | 列出音频输入设备 |
 | `voice-assistant test-wake` | 唤醒词调试：实时打印检测得分 |
@@ -203,6 +223,7 @@ setup 重设或每次启动都会按当前唤醒词/权限重写，请勿手改�
 
 ## Roadmap
 
+- [x] 跨平台桌面窗口 — egui + glow，与终端共用同一份事件流（`voice-assistant gui`）
 - [x] TTS 语音回复 — 流式按句朗读，macOS `say`
 - [x] 朗读中语音打断 — 麦克风实时监听，唤醒词旁路（外放全双工需 AEC，见下）
 - [x] 可换 TTS 引擎 — `tts=cmd` sidecar（接 Kokoro/Piper 等，独立进程绕开 ort 冲突）

@@ -24,6 +24,7 @@ mod acp;
 mod agent;
 mod asr;
 mod audio;
+mod gui;
 mod setup;
 mod tts;
 mod ui;
@@ -40,6 +41,10 @@ use std::time::Duration;
 use ui::{Ui, UiCommand};
 use vad::VAD_CHUNK;
 
+/// Everything the pipeline needs, resolved once at startup.
+/// `Clone` because the window keeps the main thread and the pipeline runs on a
+/// worker with its own copy.
+#[derive(Clone)]
 struct Config {
     wake_model: String,
     wake_display: String,
@@ -168,7 +173,7 @@ fn main() -> Result<()> {
     // the binary links and starts on a machine with no models and no mic.
     const CMDS: &[&str] = &[
         "selftest", "vad-wav", "test-wake", "test-vad", "test-asr", "test-tts", "ask",
-        "agent-test", "events",
+        "agent-test", "events", "gui",
     ];
     if let Some(other) = std::env::args().nth(1) {
         if !CMDS.contains(&other.as_str()) {
@@ -187,6 +192,7 @@ fn main() -> Result<()> {
         Some("ask") => ask_cli(&cfg),
         Some("agent-test") => agent_test(&cfg),
         Some("events") => events_cli(&cfg),
+        Some("gui") => gui::run(cfg),
         Some(other) => unreachable!("unknown command {other} is rejected above"),
         None => run(&cfg),
     }
