@@ -275,6 +275,34 @@ pub fn id_of(argv: &[String]) -> Option<&'static str> {
     None
 }
 
+/// A repair hint for a launch failure we recognise.
+///
+/// Detection can only prove *necessary* conditions — dsh's `acp` profile can exist
+/// and the launch still die. This turns the one failure that actually happened
+/// into an instruction instead of a stack trace.
+///
+/// The dsh case is worth spelling out because it is a trap anyone will fall into:
+/// `@deepseek-ai/dsh` and `@deepseek-ai/dsh-acp-app` do **not** share a `latest`
+/// tag. `npm i -g @deepseek-ai/dsh` installs 0.1.1-rc.2 while `dsh plugin add`
+/// pulls acp-app 0.1.2-*, and the newer app then asks the older launcher for
+/// hooks (`ctx.appExit` / `ctx.appReady`) it does not have. Aligning both on the
+/// 0.1.2 line fixes it.
+pub fn repair_hint(id: &str, err: &str) -> Option<&'static str> {
+    match id {
+        "deepseek"
+            if err.contains("appExit")
+                || err.contains("appReady")
+                || err.contains("plugin tree failed to load") =>
+        {
+            Some("dsh 与 acp-app 版本错配（两个包的 latest 不同线）。对齐后重试: npm i -g @deepseek-ai/dsh@next")
+        }
+        "deepseek" if err.contains("does not exist") => {
+            Some("acp profile 没配好: dsh plugin --profile acp add @deepseek-ai/dsh-acp-app（需要 pnpm）")
+        }
+        _ => None,
+    }
+}
+
 /// Command that installs the *adapter* globally, if this agent needs one.
 /// Returned for display; the caller decides whether to run it.
 pub fn install_argv(k: &Kind) -> Option<Vec<String>> {
@@ -424,6 +452,24 @@ mod tests {
         let cmd = install_argv(k).unwrap();
         assert_eq!(cmd[0], "dsh");
         assert!(cmd.contains(&"@deepseek-ai/dsh-acp-app".to_string()), "{cmd:?}");
+    }
+
+    /// The dsh version-skew trap: the two packages' `latest` tags are not on the
+    /// same line, so the newer app asks the older launcher for hooks it lacks.
+    /// A stack trace is useless here; the fix is one command.
+    #[test]
+    fn a_recognised_failure_becomes_an_instruction() {
+        let skew = "failed to apply loader entry acp-app-startup: stdio app: the \
+                    launcher must provide ctx.appExit and ctx.appReady";
+        let hint = repair_hint("deepseek", skew).expect("skew should be recognised");
+        assert!(hint.contains("dsh@next"), "{hint}");
+
+        let missing = repair_hint("deepseek", "profile \"acp\" does not exist").unwrap();
+        assert!(missing.contains("dsh plugin"), "{missing}");
+
+        // Nothing invented for failures we do not understand.
+        assert_eq!(repair_hint("deepseek", "some unrelated explosion"), None);
+        assert_eq!(repair_hint("kiro", skew), None);
     }
 
     #[test]

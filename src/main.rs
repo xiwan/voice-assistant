@@ -571,6 +571,13 @@ fn run_with(cfg: &Config, ui: Ui, commands: Receiver<UiCommand>) -> Result<()> {
                     conv.busy = false;
                     ui.busy(false);
                     ui.error(format!("agent 起不来: {why}"));
+                    // Turn a recognised failure into an instruction. Detection can
+                    // only prove necessary conditions; this covers the rest.
+                    if let Some(hint) = agents::id_of(&cfg.agent_cmd)
+                        .and_then(|id| agents::repair_hint(id, &why))
+                    {
+                        ui.notice(hint);
+                    }
                     match usable_alternative(cfg) {
                         Some((alt, argv)) => {
                             ui.notice(format!("改用 {}", alt.label));
