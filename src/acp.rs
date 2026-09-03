@@ -26,6 +26,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use crossbeam_channel::{unbounded, Receiver};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
+use std::sync::{Arc, Mutex};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -76,11 +77,19 @@ impl AcpConnection {
             .args(&cmd[1..])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            // Captured, not inherited: a crashing backend used to dump dozens of
+            // lines of stack trace over the terminal UI, while the window showed
+            // nothing at all. Now it goes to a log file and only the useful tail
+            // is reported as an event.
+            .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| anyhow!("failed to launch agent `{}`: {e}", cmd.join(" ")))?;
         let stdin = child.stdin.take().context("agent stdin unavailable")?;
         let stdout = child.stdout.take().context("agent stdout unavailable")?;
+        let tail = match child.stderr.take() {
+            Some(err) => spawn_stderr_reader(err),
+            None => Arc::new(Mutex::new(Vec::new())),
+        };
         let incoming = spawn_reader(stdout);
         let mut c = Self {
             child,
@@ -93,10 +102,19 @@ impl AcpConnection {
             tts,
             speech: SpeechBuffer::default(),
         };
-        c.handshake(&incoming)?;
+        // A backend that dies on startup usually explains itself on stderr, but
+        // the explanation can land a moment after the pipe closes — hence the
+        // short grace before reading the tail.
+        if let Err(e) = c.handshake(&incoming) {
+            thread::sleep(Duration::from_millis(300));
+            let why = first_useful_line(&tail);
+            return Err(match why {
+                Some(line) => anyhow!("{e} — agent 说: {line}"),
+                None => e,
+            });
+        }
         Ok((c, incoming))
     }
-
     fn handshake(&mut self, incoming: &Receiver<Incoming>) -> Result<()> {
         let init = self.request_blocking(
             incoming,
@@ -338,6 +356,50 @@ impl Drop for AcpConnection {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// How many stderr lines to keep for diagnosing a failed launch.
+const STDERR_TAIL: usize = 40;
+
+/// Drain the child's stderr into `~/.voice-assistant/agent.log` and keep the last
+/// few lines in memory. Backends are chatty and some of them crash with a stack
+/// trace; neither belongs in a conversation UI, but both belong somewhere.
+fn spawn_stderr_reader(err: std::process::ChildStderr) -> Arc<Mutex<Vec<String>>> {
+    let tail: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = tail.clone();
+    thread::spawn(move || {
+        let path = crate::setup::base_dir().join("agent.log");
+        let mut log = std::fs::OpenOptions::new().create(true).append(true).open(&path).ok();
+        for line in BufReader::new(err).lines().map_while(Result::ok) {
+            if let Some(f) = log.as_mut() {
+                let _ = writeln!(f, "{line}");
+            }
+            if let Ok(mut t) = sink.lock() {
+                if t.len() == STDERR_TAIL {
+                    t.remove(0);
+                }
+                t.push(line);
+            }
+        }
+    });
+    tail
+}
+
+/// The first line worth showing a human: not blank, not a stack frame, not the
+/// source-echo lines Node prints around a thrown error.
+fn first_useful_line(tail: &Arc<Mutex<Vec<String>>>) -> Option<String> {
+    let lines = tail.lock().ok()?;
+    lines
+        .iter()
+        .map(|l| l.trim())
+        .find(|l| {
+            !l.is_empty()
+                && !l.starts_with("at ")
+                && !l.starts_with('^')
+                && !l.starts_with("file://")
+                && !l.starts_with("Node.js v")
+        })
+        .map(|l| crate::ui::truncate(l))
 }
 
 /// Reader subthread: turn the child's stdout into a channel of `Incoming`.

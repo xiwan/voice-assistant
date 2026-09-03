@@ -538,6 +538,20 @@ fn run_with(cfg: &Config, ui: Ui, commands: Receiver<UiCommand>) -> Result<()> {
                     conv.busy = false;
                     ui.busy(false);
                 }
+                // The supervisor has given up on this backend. It cannot pick a
+                // replacement (it knows nothing about the registry), so we do.
+                AgentState::Failed(why) => {
+                    conv.busy = false;
+                    ui.busy(false);
+                    ui.error(format!("agent 起不来: {why}"));
+                    match usable_alternative(cfg) {
+                        Some((alt, argv)) => {
+                            ui.notice(format!("改用 {}", alt.label));
+                            agent.switch(argv);
+                        }
+                        None => ui.error("没有可用的 agent，界面仍可用但没法执行任务"),
+                    }
+                }
                 AgentState::Ready => {}
             }
         }
@@ -675,6 +689,16 @@ struct Conv {
 ///
 /// Only registry agents can be judged: a custom command is launched as written,
 /// since we know nothing about it.
+/// The first registry agent that can actually start, other than the one
+/// configured. Used both at startup and after the supervisor gives up.
+fn usable_alternative(cfg: &Config) -> Option<(&'static agents::Kind, Vec<String>)> {
+    let current = agents::id_of(&cfg.agent_cmd);
+    agents::KINDS
+        .iter()
+        .find(|k| Some(k.id) != current && agents::state(k).usable())
+        .map(|k| (k, agents::argv(k, &cfg.agent_mode)))
+}
+
 fn fallback_if_unusable(cfg: &Config, ui: &Ui) -> Vec<String> {
     let Some(kind) = agents::id_of(&cfg.agent_cmd).and_then(agents::find) else {
         return cfg.agent_cmd.clone(); // custom command: not ours to second-guess
@@ -683,8 +707,8 @@ fn fallback_if_unusable(cfg: &Config, ui: &Ui) -> Vec<String> {
     if state.usable() {
         return cfg.agent_cmd.clone();
     }
-    match agents::KINDS.iter().find(|k| agents::state(k).usable()) {
-        Some(alt) => {
+    match usable_alternative(cfg) {
+        Some((alt, argv)) => {
             ui.error(format!(
                 "{} 现在不可用（{}），先用 {} 顶上",
                 kind.label,
@@ -694,7 +718,7 @@ fn fallback_if_unusable(cfg: &Config, ui: &Ui) -> Vec<String> {
             if let Some(fix) = agents::install_argv(kind) {
                 ui.notice(format!("修好它: {}", fix.join(" ")));
             }
-            agents::argv(alt, &cfg.agent_mode)
+            argv
         }
         // Nothing usable at all: launch as configured so the real error shows.
         None => cfg.agent_cmd.clone(),

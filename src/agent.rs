@@ -48,6 +48,10 @@ pub enum AgentState {
     Busy,
     Idle(String), // stopReason: end_turn / cancelled / ...
     Restarting(String),
+    /// Repeated launch failures: retrying is not going to help, so the supervisor
+    /// stops and waits for a `Switch`. The owner decides what to do about it —
+    /// it, not this module, knows which other agents exist.
+    Failed(String),
 }
 
 /// How long a `session/cancel` may take before we escalate to kill+respawn.
@@ -107,10 +111,14 @@ fn supervisor(
 ) {
     let mut cmd = cmd; // replaced in place by AgentCmd::Switch
     let mut backoff = BACKOFF_START;
+    /// Give up after this many launches that never reached a handshake.
+    const MAX_LAUNCH_FAILS: u32 = 3;
+    let mut fails = 0u32;
     loop {
         match AcpConnection::connect(&cmd, auto_approve, tts.clone(), ui.clone()) {
             Ok((mut conn, incoming)) => {
                 backoff = BACKOFF_START; // healthy connection resets backoff
+                fails = 0;
                 let _ = state_tx.send(AgentState::Ready);
                 // Report the argv that actually connected: a switch request is
                 // not evidence that the switch happened, and a front end has no
@@ -147,11 +155,31 @@ fn supervisor(
                 }
             }
             Err(e) => {
+                fails += 1;
+                if fails >= MAX_LAUNCH_FAILS {
+                    // Stop hammering a backend that cannot start. Park on the
+                    // command channel so a switch still gets through.
+                    let _ = state_tx.send(AgentState::Failed(format!("{e}")));
+                    loop {
+                        match wait_or_shutdown(&cmd_rx, Duration::from_secs(3600)) {
+                            Downtime::Shutdown => return,
+                            Downtime::Switch(next) => {
+                                cmd = next;
+                                fails = 0;
+                                backoff = BACKOFF_START;
+                                break;
+                            }
+                            Downtime::Elapsed => {}
+                        }
+                    }
+                    continue;
+                }
                 let _ = state_tx.send(AgentState::Restarting(format!("启动失败: {e}")));
                 match wait_or_shutdown(&cmd_rx, backoff) {
                     Downtime::Shutdown => return,
                     Downtime::Switch(next) => {
                         cmd = next;
+                        fails = 0;
                         backoff = BACKOFF_START;
                     }
                     Downtime::Elapsed => backoff = (backoff * 2).min(BACKOFF_MAX),
