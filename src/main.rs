@@ -22,6 +22,7 @@
 
 mod acp;
 mod agent;
+mod agents;
 mod asr;
 mod audio;
 mod gui;
@@ -173,7 +174,7 @@ fn main() -> Result<()> {
     // the binary links and starts on a machine with no models and no mic.
     const CMDS: &[&str] = &[
         "selftest", "vad-wav", "test-wake", "test-vad", "test-asr", "test-tts", "ask",
-        "agent-test", "events", "gui",
+        "agent-test", "events", "gui", "agents",
     ];
     if let Some(other) = std::env::args().nth(1) {
         if !CMDS.contains(&other.as_str()) {
@@ -193,6 +194,7 @@ fn main() -> Result<()> {
         Some("agent-test") => agent_test(&cfg),
         Some("events") => events_cli(&cfg),
         Some("gui") => gui::run(cfg),
+        Some("agents") => agents_cli(&cfg),
         Some(other) => unreachable!("unknown command {other} is rejected above"),
         None => run(&cfg),
     }
@@ -394,6 +396,65 @@ fn events_cli(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
+/// Hidden: list the agents this machine can talk to, and optionally prove a hot
+/// switch works without restarting the process.
+///   voice-assistant agents              — what is installed, how it launches
+///   voice-assistant agents switch <id>  — ask one agent its name, switch, ask again
+fn agents_cli(cfg: &Config) -> Result<()> {
+    println!("当前: {}", cfg.agent_cmd.join(" "));
+    if let Some(id) = agents::id_of(&cfg.agent_cmd) {
+        println!("识别为: {id}");
+    }
+    println!();
+    for k in agents::KINDS {
+        let st = agents::state(k);
+        println!("[{}] {} — {}", if st.usable() { "ok" } else { "!!" }, k.label, st.label());
+        println!("    启动: {}", agents::argv(k, &cfg.agent_mode).join(" "));
+        match st {
+            agents::State::NeedsCli => println!("    安装 CLI: {}", k.install_cli),
+            agents::State::NeedsAdapter | agents::State::ViaNpx => {
+                if let Some(cmd) = agents::install_argv(k) {
+                    println!("    安装适配器: {}", cmd.join(" "));
+                }
+            }
+            agents::State::Ready => {}
+        }
+    }
+
+    let Some(target) = std::env::args().nth(2).filter(|a| a == "switch").and_then(|_| std::env::args().nth(3))
+    else {
+        return Ok(());
+    };
+    let Some(kind) = agents::find(&target) else {
+        anyhow::bail!("未知 agent: {target}（可选: kiro/claude/codex/gemini）");
+    };
+    anyhow::ensure!(
+        agents::state(kind).usable(),
+        "{} 不可用: {}",
+        kind.label,
+        agents::state(kind).label()
+    );
+
+    // One question, a switch, the same question again: the answers should come
+    // from different agents while this process never restarts.
+    let ui = Ui::terminal(&cfg.persona);
+    let silent = tts::Tts::spawn(tts::Engine::Off, Arc::new(AtomicBool::new(false)));
+    eprintln!("\n[1] 当前 agent: {}", cfg.agent_cmd.join(" "));
+    let agent = AgentHandle::spawn(cfg.agent_cmd.clone(), cfg.auto_approve, silent, ui.clone());
+    let q = "你是什么模型？只回答模型或产品名，一行以内。";
+    agent.prompt(q.into());
+    wait_for_idle(&agent);
+
+    let argv = agents::argv(kind, &cfg.agent_mode);
+    eprintln!("\n[2] 热切换到 {}: {}", kind.label, argv.join(" "));
+    agent.switch(argv);
+    agent.prompt(q.into());
+    wait_for_idle(&agent);
+    agent.shutdown();
+    eprintln!("\n[done] 进程未重启，两次回答若来自不同 agent 即证明切换生效");
+    Ok(())
+}
+
 fn run(cfg: &Config) -> Result<()> {
     // The terminal is just one front end; a window swaps in here (v0.11.0) by
     // passing `Ui::channel()` and a real command receiver instead.
@@ -445,8 +506,11 @@ fn run_with(cfg: &Config, ui: Ui, commands: Receiver<UiCommand>) -> Result<()> {
                     ui.busy(true);
                 }
                 AgentState::Idle(reason) => {
-                    if reason != "cancelled" && conv.busy {
-                        conv.followup = true; // real reply -> listen without re-waking
+                    // Only a real answer earns a follow-up window. A cancelled
+                    // turn was the user's choice, and a failed one has nothing
+                    // to follow up on — opening the mic then just times out.
+                    if reason != "cancelled" && reason != "error" && conv.busy {
+                        conv.followup = true;
                     }
                     conv.busy = false;
                     ui.busy(false);
@@ -495,6 +559,10 @@ fn run_with(cfg: &Config, ui: Ui, commands: Receiver<UiCommand>) -> Result<()> {
                         speaker.shutdown();
                         agent.shutdown();
                         return Ok(());
+                    }
+                    Ok(UiCommand::SwitchAgent(id)) => {
+                        switch_agent(&id, &agent, &ui, cfg);
+                        continue;
                     }
                     Ok(cmd) => {
                         let (intent, text) = from_command(cmd);
@@ -550,6 +618,34 @@ struct Conv {
     resumable: Option<String>,
 }
 
+/// Swap the running agent for another one from the registry.
+///
+/// No process restart: the supervisor kills the current connection and opens a
+/// new one, which is the same path it uses to recover from a crash. The choice is
+/// persisted so the next start keeps it — written as a launch command, so the
+/// config format is unchanged and hand-edited custom commands still work.
+fn switch_agent(id: &str, agent: &AgentHandle, ui: &Ui, cfg: &Config) {
+    let Some(kind) = agents::find(id) else {
+        ui.error(format!("未知 agent: {id}"));
+        return;
+    };
+    let state = agents::state(kind);
+    if !state.usable() {
+        // Refuse rather than kill a working agent for one that cannot start.
+        ui.error(format!("{} 现在不可用（{}）", kind.label, state.label()));
+        return;
+    }
+    let argv = agents::argv(kind, &cfg.agent_mode);
+    ui.notice(format!("切换到 {}：{}", kind.label, argv.join(" ")));
+    agent.switch(argv.clone());
+    if let Some(mut s) = setup::load() {
+        s.agent_cmd = argv.join(" ");
+        if let Err(e) = setup::save(&s) {
+            ui.error(format!("agent 已切换，但写入配置失败: {e}"));
+        }
+    }
+}
+
 /// Transcribe an utterance and dispatch it. Everything after the transcript is
 /// shared with front-end commands via `act`, so a button and a spoken phrase
 /// take exactly the same path.
@@ -577,13 +673,18 @@ fn handle_command(
 }
 
 /// Map a front-end command onto the same intents speech produces. `Quit` is
-/// handled by the caller (it tears the pipeline down) and never reaches here.
+/// handled by the caller (it tears the pipeline down) and `SwitchAgent` by
+/// `switch_agent`; neither is a conversation intent.
 fn from_command(cmd: UiCommand) -> (Intent, String) {
     match cmd {
         UiCommand::Prompt(text) => (Intent::New, text),
         UiCommand::Pause => (Intent::Pause, String::new()),
         UiCommand::Resume => (Intent::Resume, String::new()),
         UiCommand::Abandon | UiCommand::Quit => (Intent::Abandon, String::new()),
+        // Reached only if a caller forgets to intercept it; abandoning is the
+        // conservative reading (do not leave a task running against an agent
+        // that is being replaced).
+        UiCommand::SwitchAgent(_) => (Intent::Abandon, String::new()),
     }
 }
 

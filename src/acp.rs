@@ -213,16 +213,31 @@ impl AcpConnection {
                 // Response to a request we sent.
                 if self.active_prompt == Some(id) {
                     self.active_prompt = None;
-                    let stop = msg["result"]["stopReason"]
-                        .as_str()
-                        .unwrap_or("end_turn")
-                        .to_string();
+                    // A JSON-RPC *error* response has no `result`, so reading
+                    // stopReason with a default would report a failed turn as a
+                    // normal one — silently, since the front end shows events and
+                    // not the agent's stderr. Different backends fail in very
+                    // different ways (auth, quota, geo restrictions), so the
+                    // message has to reach the user.
+                    let stop = if let Some(err) = msg.get("error") {
+                        let detail = err
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .unwrap_or("agent 未说明原因");
+                        self.ui.error(format!("agent 报错: {}", crate::ui::truncate(detail)));
+                        "error".to_string()
+                    } else {
+                        msg["result"]["stopReason"]
+                            .as_str()
+                            .unwrap_or("end_turn")
+                            .to_string()
+                    };
                     // Lets the front end close a half-written line.
                     self.ui.turn_end(&stop);
                     // Speak the tail of the reply (a last sentence without
-                    // final punctuation). A cancelled turn stays silent.
+                    // final punctuation). A cancelled or failed turn stays silent.
                     match self.speech.flush() {
-                        Some(rest) if stop != "cancelled" => self.tts.say(rest),
+                        Some(rest) if stop != "cancelled" && stop != "error" => self.tts.say(rest),
                         _ => {}
                     }
                     return Some(stop);

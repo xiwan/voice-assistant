@@ -99,6 +99,10 @@ pub enum UiCommand {
     Resume,
     /// Interrupt and forget the task (算了).
     Abandon,
+    /// Switch to another ACP agent by registry id (kiro / claude / codex /
+    /// gemini). Handled without restarting the process: the supervisor drops the
+    /// current connection and opens one with the new command.
+    SwitchAgent(String),
     /// Shut the pipeline down.
     Quit,
 }
