@@ -81,7 +81,7 @@ voice-assistant gui
 - 对话流：你说的话、流式生成的回答；思考过程和工具调用默认折叠，勾选后展开
 - 暂停 / 继续 / 放弃三个按钮，和说"暂停/继续/算了"完全等价
 - 输入框：不方便说话时直接打字
-- ⚙ 设置面板：切换 agent（kiro-cli / Claude Code / Codex / Gemini，自动探测本机是否
+- ⚙ 设置面板：切换 agent（kiro-cli / Claude Code / Codex / DeepSeek Harness，自动探测本机是否
   装了，缺 ACP 适配器可一键 `npm i -g` 装上）、拖动唤醒阈值和断句参数（即时生效并写回
   配置）。切 agent **不重启进程**——supervisor 换个命令重连即可
 

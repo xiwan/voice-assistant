@@ -101,13 +101,16 @@ pub const KINDS: &[Kind] = &[
         install: Install::Npm("@openai/codex"),
     },
     Kind {
-        id: "gemini",
-        label: "Gemini CLI",
-        cli: "gemini",
-        // ACP is built in behind a flag.
+        id: "deepseek",
+        label: "DeepSeek Harness",
+        cli: "dsh",
+        // ACP is not a separate binary here: `@deepseek-ai/dsh-acp` is a plugin
+        // with peer deps on dsh internals, surfaced as the `acp` profile. The
+        // official docs are explicit — "An ACP v1 SDK client initializes
+        // `dsh --profile acp`" — and stdout is reserved for ACP JSON-RPC frames.
         adapter_bin: None,
         adapter_pkg: None,
-        install: Install::Npm("@google/gemini-cli"),
+        install: Install::Npm("@deepseek-ai/dsh"),
     },
 ];
 
@@ -130,8 +133,8 @@ impl State {
     pub fn label(self) -> &'static str {
         match self {
             State::Ready => "可用",
-            State::ViaNpx => "可用（经 npx，首次较慢）",
-            State::NeedsAdapter => "缺 ACP 适配器",
+            State::ViaNpx => "可用 (npx)",
+            State::NeedsAdapter => "缺适配器",
             State::NeedsCli => "未安装",
         }
     }
@@ -177,7 +180,8 @@ pub fn argv_with(k: &Kind, mode: &str, on_path: impl Fn(&str) -> bool) -> Vec<St
             }
             argv
         }
-        "gemini" => vec![s("gemini"), s("--experimental-acp")],
+        // The profile flag is what turns dsh into an ACP server.
+        "deepseek" => vec![s("dsh"), s("--profile"), s("acp")],
         _ => match (k.adapter_bin, k.adapter_pkg) {
             // Prefer the installed binary: no npx resolution on every launch,
             // and the supervisor may respawn it after a crash.
@@ -298,7 +302,7 @@ mod tests {
     /// Agents that speak ACP themselves must never be routed through npx.
     #[test]
     fn native_acp_agents_need_no_adapter() {
-        for id in ["kiro", "gemini"] {
+        for id in ["kiro", "deepseek"] {
             let k = find(id).unwrap();
             assert!(install_argv(k).is_none(), "{id} should need no adapter");
             let argv = argv_with(k, "safe", path(&[k.cli]));
@@ -318,11 +322,11 @@ mod tests {
     }
 
     #[test]
-    fn gemini_uses_its_acp_flag() {
-        let k = find("gemini").unwrap();
+    fn deepseek_is_launched_through_its_acp_profile() {
+        let k = find("deepseek").unwrap();
         assert_eq!(
-            argv_with(k, "safe", path(&["gemini"])),
-            vec!["gemini", "--experimental-acp"]
+            argv_with(k, "safe", path(&["dsh"])),
+            vec!["dsh", "--profile", "acp"]
         );
     }
 

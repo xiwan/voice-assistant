@@ -42,7 +42,7 @@ pub fn run(cfg: crate::Config) -> anyhow::Result<()> {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([880.0, 620.0])
+            .with_inner_size([960.0, 640.0])
             .with_min_inner_size([560.0, 380.0])
             .with_title(format!("{} · voice assistant", cfg.persona)),
         ..Default::default()
@@ -198,7 +198,7 @@ impl App {
                 ctx.request_repaint();
             }
         });
-        App {
+        let mut app = App {
             inbox,
             commands,
             rows: Vec::new(),
@@ -218,7 +218,9 @@ impl App {
             agent_states: Vec::new(),
             silence_ms: cfg.silence_ms,
             no_speech_ms: cfg.no_speech_ms,
-        }
+        };
+        app.refresh_agents();
+        app
     }
 
     /// Re-probe which agents are installed. Filesystem work, so it happens on
@@ -441,8 +443,15 @@ impl App {
                 } else {
                     egui::Color32::from_rgb(200, 150, 60)
                 };
-                ui.colored_label(color, if selected { "◉" } else { "○" });
-                ui.label(kind.label);
+                // Selection is carried by the label's weight and the marker, so
+                // the icon can stay purely informational.
+                agent_icon(ui, kind.id, color);
+                if selected {
+                    ui.strong(kind.label);
+                    ui.colored_label(color, "●");
+                } else {
+                    ui.label(kind.label);
+                }
                 ui.weak(state.label());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     match state {
@@ -454,13 +463,13 @@ impl App {
                             {
                                 switch_to = Some(kind.id);
                             }
-                            if *s == agents::State::ViaNpx && ui.button("装到本地").clicked() {
+                            if *s == agents::State::ViaNpx && ui.button("装本地").clicked() {
                                 install = Some(kind.id);
                             }
                         }
                         // CLI present, adapter missing: we can fix that.
                         agents::State::NeedsAdapter => {
-                            if ui.button("安装适配器").clicked() {
+                            if ui.button("装适配器").clicked() {
                                 install = Some(kind.id);
                             }
                         }
@@ -469,10 +478,13 @@ impl App {
                         // shows the instruction instead of a button that lies.
                         agents::State::NeedsCli => {
                             if kind.install.argv().is_some() {
-                                if ui.button("安装").clicked() {
+                                if ui
+                                    .button("安装")
+                                    .on_hover_text(kind.install.hint())
+                                    .clicked()
+                                {
                                     install_cli = Some(kind.id);
                                 }
-                                ui.weak(kind.install.hint());
                             } else {
                                 ui.weak(kind.install.hint());
                             }
@@ -556,6 +568,89 @@ impl App {
     }
 }
 
+/// Draw a small monochrome mark for an agent, sized to the current text height.
+///
+/// These are **hand-drawn approximations, not the vendors' logo files**. Two
+/// reasons: `default-features = false` on eframe deliberately leaves the image
+/// loaders out of the build (adding a PNG/SVG decoder for four 16px glyphs is a
+/// poor trade), and redistributing trademarked brand assets inside an
+/// MIT-licensed repo is a licence question this project should not take on.
+/// egui's bundled fonts were checked first — they have no ghost, whale, hexagon
+/// or even ●, so an emoji would have rendered as tofu.
+fn agent_icon(ui: &mut egui::Ui, id: &str, color: egui::Color32) {
+    let size = ui.text_style_height(&egui::TextStyle::Body);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
+    let p = ui.painter();
+    let c = rect.center();
+    let r = size * 0.42;
+    let stroke = egui::Stroke::new((size * 0.09).max(1.0), color);
+    let bg = ui.visuals().panel_fill;
+    match id {
+        // kiro: a ghost — domed head, three-scallop hem, two eyes punched out.
+        "kiro" => {
+            p.circle_filled(c - egui::vec2(0.0, r * 0.25), r * 0.85, color);
+            p.rect_filled(
+                egui::Rect::from_min_max(
+                    egui::pos2(c.x - r * 0.85, c.y - r * 0.25),
+                    egui::pos2(c.x + r * 0.85, c.y + r * 0.55),
+                ),
+                0.0,
+                color,
+            );
+            for i in 0..3 {
+                let x = c.x - r * 0.85 + r * 0.567 * (i as f32 * 2.0 + 1.0);
+                p.circle_filled(egui::pos2(x, c.y + r * 0.55), r * 0.28, color);
+            }
+            for s in [-1.0, 1.0] {
+                p.circle_filled(egui::pos2(c.x + s * r * 0.32, c.y - r * 0.3), r * 0.16, bg);
+            }
+        }
+        // deepseek: a whale — body, tail fluke, spout.
+        "deepseek" => {
+            p.circle_filled(c + egui::vec2(-r * 0.15, r * 0.15), r * 0.72, color);
+            p.add(egui::Shape::convex_polygon(
+                vec![
+                    egui::pos2(c.x + r * 0.45, c.y + r * 0.15),
+                    egui::pos2(c.x + r * 1.05, c.y - r * 0.35),
+                    egui::pos2(c.x + r * 1.05, c.y + r * 0.6),
+                ],
+                color,
+                egui::Stroke::NONE,
+            ));
+            // Spout: two rising dots above the head.
+            p.circle_filled(egui::pos2(c.x - r * 0.5, c.y - r * 0.75), r * 0.14, color);
+            p.circle_filled(egui::pos2(c.x - r * 0.25, c.y - r * 1.0), r * 0.1, color);
+            p.circle_filled(egui::pos2(c.x - r * 0.55, c.y + r * 0.02), r * 0.12, bg); // eye
+        }
+        // claude: Anthropic's radial burst, simplified to six spokes.
+        "claude" => {
+            for i in 0..6 {
+                let a = std::f32::consts::TAU * i as f32 / 6.0;
+                p.line_segment(
+                    [
+                        c + egui::vec2(a.cos(), a.sin()) * r * 0.35,
+                        c + egui::vec2(a.cos(), a.sin()) * r,
+                    ],
+                    stroke,
+                );
+            }
+        }
+        // codex: a hexagonal knot standing in for OpenAI's mark, which is too
+        // intricate to fake convincingly at this size.
+        _ => {
+            let pts: Vec<egui::Pos2> = (0..6)
+                .map(|i| {
+                    let a = std::f32::consts::TAU * i as f32 / 6.0 - std::f32::consts::FRAC_PI_2;
+                    c + egui::vec2(a.cos(), a.sin()) * r
+                })
+                .collect();
+            p.add(egui::Shape::closed_line(pts, stroke));
+            p.circle_filled(c, r * 0.22, color);
+        }
+    }
+    ui.add_space(4.0);
+}
+
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.drain();
@@ -575,7 +670,7 @@ impl eframe::App for App {
         if self.show_settings {
             egui::Panel::right("settings").show(ui, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.set_min_width(320.0);
+                    ui.set_min_width(360.0);
                     self.settings(ui);
                 });
             });
