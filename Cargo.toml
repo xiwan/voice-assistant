@@ -1,6 +1,6 @@
 [package]
 name = "voice-assistant"
-version = "0.12.0"
+version = "0.12.1"
 edition = "2021"
 
 [dependencies]
@@ -13,10 +13,16 @@ crossbeam-channel = "0.5"
 # older Windows/Linux GPUs; `default_fonts` is kept for the Latin glyphs — CJK
 # still has to come from a system font, egui ships none.
 #
+# `x11` and `wayland` are NOT optional extras: turning off default features also
+# turns off eframe's platform backends, and winit then fails to compile on Linux
+# with "The platform you're compiling for is not supported by winit". macOS and
+# Windows build fine without them, which is exactly why CI caught this and a Mac
+# could not.
+#
 # NOTE: this file is a Protected File because `ort`/`ort-sys` must both stay
 # pinned at =2.0.0-rc.9 (pre-release semver otherwise resolves ort-sys to rc.10
 # and the build breaks). Verify with `cargo tree -i ort-sys` after any change here.
-eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts"] }
+eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
 ort = "=2.0.0-rc.9"
 ort-sys = "=2.0.0-rc.9"
 serde_json = "1"
