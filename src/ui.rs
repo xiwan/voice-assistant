@@ -84,6 +84,10 @@ pub enum UiEvent {
     AgentRestarting(String),
     /// A turn is / is no longer running.
     Busy(bool),
+    /// The player started or stopped talking. Emitted by the player itself, which
+    /// is the only place that knows — an earlier version left this out rather than
+    /// guess.
+    Speaking(bool),
     /// The assistant spoke on its own initiative (e.g. the sign-off).
     Spoken(String),
 }
@@ -136,6 +140,10 @@ pub enum Tunable {
     NoSpeechMs(f32),
     /// Switch between always-listening (wake word) and hold-to-talk.
     PushToTalk(bool),
+    /// kiro-cli permission mode: readonly / safe / full. Applies to the next tool
+    /// call immediately; the agent is relaunched because the flag is on its
+    /// command line and its allow-list file has to be rewritten.
+    AgentMode(String),
 }
 
 /// Handle the pipeline holds. Cloneable and `Send`, because the ACP supervisor
@@ -215,6 +223,9 @@ impl Ui {
     pub fn busy(&self, busy: bool) {
         self.emit(UiEvent::Busy(busy));
     }
+    pub fn speaking(&self, speaking: bool) {
+        self.emit(UiEvent::Speaking(speaking));
+    }
     pub fn spoken(&self, text: &str) {
         self.emit(UiEvent::Spoken(text.to_string()));
     }
@@ -250,7 +261,7 @@ impl Term {
                 &format!("== voice assistant ready, say the wake word (\"{wake_word}\") =="),
             ),
             // A meter's worth of data per audio window: far too chatty for a tty.
-            UiEvent::WakeScore(_) | UiEvent::Busy(_) => {}
+            UiEvent::WakeScore(_) | UiEvent::Busy(_) | UiEvent::Speaking(_) => {}
             UiEvent::Wake { score, interrupting } => {
                 let hint = if *interrupting { "，打断中" } else { "" };
                 // \x07 (BEL) is the audible "I'm listening" cue.

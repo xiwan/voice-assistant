@@ -224,7 +224,10 @@ impl Tts {
     /// Start the player thread. `muted` is the flag the audio callback reads:
     /// the player raises it while speaking (half duplex) and clears it a short
     /// tail after the last word.
-    pub fn spawn(engine: Engine, muted: Arc<AtomicBool>) -> Self {
+    /// `ui` is how the player reports that it started or stopped talking. It is the
+    /// only place that knows: the mute flag and the "speaking" light are the same
+    /// fact, so they are set together rather than inferred separately.
+    pub fn spawn(engine: Engine, muted: Arc<AtomicBool>, ui: crate::ui::Ui) -> Self {
         let pending = Arc::new(AtomicUsize::new(0));
         let epoch = Arc::new(AtomicU64::new(0));
         if !engine.enabled() {
@@ -232,7 +235,7 @@ impl Tts {
         }
         let (tx, rx) = unbounded::<Cmd>();
         let (p, e) = (pending.clone(), epoch.clone());
-        thread::spawn(move || player(engine, rx, p, e, muted));
+        thread::spawn(move || player(engine, rx, p, e, muted, ui));
         Self { tx: Some(tx), pending, epoch }
     }
 
@@ -281,6 +284,7 @@ fn player(
     pending: Arc<AtomicUsize>,
     epoch: Arc<AtomicU64>,
     muted: Arc<AtomicBool>,
+    ui: crate::ui::Ui,
 ) {
     let mut queue: VecDeque<(String, u64)> = VecDeque::new();
     loop {
@@ -290,7 +294,7 @@ fn player(
                 Ok(Cmd::Say(t, g)) => queue.push_back((t, g)),
                 Ok(Cmd::Stop) => {}
                 Ok(Cmd::Shutdown) | Err(_) => {
-                    muted.store(false, Ordering::SeqCst);
+                    set_speaking(&muted, &ui, false);
                     return;
                 }
             }
@@ -301,12 +305,12 @@ fn player(
             continue;
         }
 
-        muted.store(true, Ordering::SeqCst);
+        set_speaking(&muted, &ui, true);
         let mut child = match engine.start(&text) {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("[tts] {e}");
-                done(&pending, &queue, &muted);
+                done(&pending, &queue, &muted, &ui);
                 continue;
             }
         };
@@ -330,7 +334,7 @@ fn player(
                 Ok(Cmd::Shutdown) | Err(RecvTimeoutError::Disconnected) => {
                     let _ = child.kill();
                     let _ = child.wait();
-                    muted.store(false, Ordering::SeqCst);
+                    set_speaking(&muted, &ui, false);
                     return;
                 }
                 Err(RecvTimeoutError::Timeout) => {}
@@ -339,22 +343,34 @@ fn player(
 
         if interrupted {
             pending.store(0, Ordering::SeqCst);
-            muted.store(false, Ordering::SeqCst);
+            set_speaking(&muted, &ui, false);
         } else {
             let _ = pending.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
                 Some(n.saturating_sub(1))
             });
-            done(&pending, &queue, &muted);
+            done(&pending, &queue, &muted, &ui);
         }
     }
 }
 
 /// Unmute once nothing is left to say (after a short tail for room echo).
-fn done(pending: &AtomicUsize, queue: &VecDeque<(String, u64)>, muted: &AtomicBool) {
+/// Raise or clear the mute flag *and* report it, so the mic gate and the UI can
+/// never disagree about whether the assistant is talking.
+fn set_speaking(muted: &AtomicBool, ui: &crate::ui::Ui, on: bool) {
+    muted.store(on, Ordering::SeqCst);
+    ui.speaking(on);
+}
+
+fn done(
+    pending: &AtomicUsize,
+    queue: &VecDeque<(String, u64)>,
+    muted: &AtomicBool,
+    ui: &crate::ui::Ui,
+) {
     if queue.is_empty() && pending.load(Ordering::SeqCst) == 0 {
         thread::sleep(TAIL);
         if pending.load(Ordering::SeqCst) == 0 {
-            muted.store(false, Ordering::SeqCst);
+            set_speaking(&muted, &ui, false);
         }
     }
 }
@@ -585,7 +601,8 @@ mod tests {
     #[test]
     fn disabled_engine_is_inert() {
         let muted = Arc::new(AtomicBool::new(false));
-        let tts = Tts::spawn(Engine::Off, muted.clone());
+        // The receiver is dropped immediately, so every event is a no-op.
+        let tts = Tts::spawn(Engine::Off, muted.clone(), crate::ui::Ui::channel().0);
         assert!(!tts.enabled());
         tts.say("这句话不会被说出来");
         assert!(!tts.is_speaking());

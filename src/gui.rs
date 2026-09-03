@@ -114,6 +114,7 @@ enum Phase {
     Idle,
     Awake,
     Thinking,
+    Speaking,
     Restarting,
 }
 
@@ -123,6 +124,7 @@ impl Phase {
             Phase::Idle => "待机中",
             Phase::Awake => "在听",
             Phase::Thinking => "思考中",
+            Phase::Speaking => "朗读中",
             Phase::Restarting => "重启中",
         }
     }
@@ -132,6 +134,7 @@ impl Phase {
             Phase::Idle => egui::Color32::from_rgb(120, 130, 140),
             Phase::Awake => egui::Color32::from_rgb(70, 190, 120),
             Phase::Thinking => egui::Color32::from_rgb(90, 160, 240),
+            Phase::Speaking => egui::Color32::from_rgb(150, 130, 230),
             Phase::Restarting => egui::Color32::from_rgb(230, 170, 60),
         }
     }
@@ -179,6 +182,8 @@ struct App {
     agent_states: Vec<(&'static agents::Kind, agents::State)>,
     silence_ms: f32,
     no_speech_ms: f32,
+    /// kiro-cli permission mode: readonly / safe / full.
+    agent_mode: String,
     /// Hold-to-talk instead of the wake word.
     push_to_talk: bool,
     /// The key held to talk, and whether we are waiting for the user to press a
@@ -187,6 +192,9 @@ struct App {
     rebinding: bool,
     /// Last key state sent, so `Talk` is emitted on edges only.
     talk_down: bool,
+    /// Reported by the player, not inferred.
+    speaking: bool,
+    busy: bool,
     /// Which secrets exist, for the mask. Values are held only to mask them and
     /// are never rendered in full or logged.
     secrets: Vec<(String, String)>,
@@ -231,10 +239,13 @@ impl App {
             agent_states: Vec::new(),
             silence_ms: cfg.silence_ms,
             no_speech_ms: cfg.no_speech_ms,
+            agent_mode: cfg.agent_mode.clone(),
             push_to_talk: cfg.push_to_talk,
             ptt_key: egui::Key::from_name(&cfg.ptt_key).unwrap_or(egui::Key::Space),
             rebinding: false,
             talk_down: false,
+            speaking: false,
+            busy: false,
             secrets: crate::setup::load_secrets(),
             key_input: std::collections::HashMap::new(),
         };
@@ -393,8 +404,23 @@ impl App {
                 self.phase = Phase::Restarting;
                 self.rows.push(Row::Error(format!("agent 重启中: {why}")));
             }
+            // Speaking outranks Thinking in the light because it is the state the
+            // user can hear; when it ends, fall back to whatever the turn is doing.
+            UiEvent::Speaking(on) => {
+                self.speaking = on;
+                self.phase = if on {
+                    Phase::Speaking
+                } else if self.busy {
+                    Phase::Thinking
+                } else {
+                    Phase::Idle
+                };
+            }
             UiEvent::Busy(busy) => {
-                self.phase = if busy {
+                self.busy = busy;
+                self.phase = if self.speaking {
+                    Phase::Speaking
+                } else if busy {
                     Phase::Thinking
                 } else if self.phase == Phase::Thinking {
                     Phase::Idle
@@ -626,6 +652,33 @@ impl App {
             ui.weak("按住说、松开结束。只在这个窗口有焦点时生效——");
             ui.weak("全局热键需要额外依赖和系统辅助功能授权，还没做。");
         }
+
+        ui.add_space(10.0);
+        ui.heading("权限（kiro-cli）");
+        // Ordered least to most dangerous, so the risky one is not the first thing
+        // a stray click lands on.
+        let mut mode = self.agent_mode.clone();
+        ui.horizontal(|ui| {
+            for (id, label) in [
+                ("readonly", "只读"),
+                ("safe", "安全命令"),
+                ("full", "完全信任"),
+            ] {
+                if ui.radio_value(&mut mode, id.to_string(), label).clicked() {
+                    self.agent_mode = mode.clone();
+                    self.send(UiCommand::Tune(Tunable::AgentMode(mode.clone())));
+                }
+            }
+        });
+        match self.agent_mode.as_str() {
+            "readonly" => ui.weak("只能读文件，最安全"),
+            "safe" => ui.weak("额外放行只读命令白名单（pwd / ls / cat / git status 等）"),
+            _ => ui.colored_label(
+                egui::Color32::from_rgb(230, 110, 100),
+                "任意命令 + 写文件。语音可能听错，慎用",
+            ),
+        };
+        ui.weak("改档立即生效：下一次工具调用就按新档判定，agent 会重连一次。");
 
         ui.add_space(10.0);
         ui.heading("模型凭据");

@@ -56,7 +56,8 @@ struct Config {
     /// Full argv used to launch the ACP agent process (kept alive across turns).
     agent_cmd: Vec<String>,
     /// Auto-approve tool-permission requests (maps from the "full" trust mode).
-    auto_approve: bool,
+    /// Shared so the settings panel can flip it while the agent is running.
+    auto_approve: Arc<AtomicBool>,
     /// kiro-cli permission mode (readonly/safe/full); used to refresh voice.json.
     agent_mode: String,
     /// Assistant persona name derived from the wake word (e.g. "Jarvis").
@@ -116,7 +117,7 @@ impl Config {
                 .split_whitespace()
                 .map(String::from)
                 .collect(),
-            auto_approve: settings.agent_mode == "full",
+            auto_approve: Arc::new(AtomicBool::new(settings.agent_mode == "full")),
             agent_mode: settings.agent_mode.clone(),
             persona: setup::persona_name(&settings.wake_word),
             tts_engine: tts::Engine::resolve(
@@ -288,10 +289,14 @@ fn ask_cli(cfg: &Config) -> Result<()> {
     anyhow::ensure!(!prompts.is_empty(), "usage: voice-assistant ask <text> [more text...]");
     sync_persona(cfg);
     eprintln!("[acp] starting agent: {}", cfg.agent_cmd.join(" "));
-    let speaker = tts::Tts::spawn(cfg.tts_engine.clone(), Arc::new(AtomicBool::new(false)));
+    let speaker = tts::Tts::spawn(
+        cfg.tts_engine.clone(),
+        Arc::new(AtomicBool::new(false)),
+        Ui::terminal(&cfg.persona),
+    );
     let agent = AgentHandle::spawn(
         cfg.agent_cmd.clone(),
-        cfg.auto_approve,
+        cfg.auto_approve.clone(),
         speaker.clone(),
         Ui::terminal(&cfg.persona),
         agent_env(&cfg.agent_cmd),
@@ -316,10 +321,14 @@ fn ask_cli(cfg: &Config) -> Result<()> {
 fn agent_test(cfg: &Config) -> Result<()> {
     sync_persona(cfg);
     eprintln!("[agent-test] launching: {}", cfg.agent_cmd.join(" "));
-    let silent = tts::Tts::spawn(tts::Engine::Off, Arc::new(AtomicBool::new(false)));
+    let silent = tts::Tts::spawn(
+        tts::Engine::Off,
+        Arc::new(AtomicBool::new(false)),
+        Ui::terminal(&cfg.persona),
+    );
     let agent = AgentHandle::spawn(
         cfg.agent_cmd.clone(),
-        cfg.auto_approve,
+        cfg.auto_approve.clone(),
         silent,
         Ui::terminal(&cfg.persona),
         agent_env(&cfg.agent_cmd),
@@ -372,10 +381,14 @@ fn events_cli(cfg: &Config) -> Result<()> {
     sync_persona(cfg);
     eprintln!("[acp] starting agent: {}", cfg.agent_cmd.join(" "));
     let (ui, events) = Ui::channel();
-    let silent = tts::Tts::spawn(tts::Engine::Off, Arc::new(AtomicBool::new(false)));
+    let silent = tts::Tts::spawn(
+        tts::Engine::Off,
+        Arc::new(AtomicBool::new(false)),
+        Ui::terminal(&cfg.persona),
+    );
     let agent = AgentHandle::spawn(
         cfg.agent_cmd.clone(),
-        cfg.auto_approve,
+        cfg.auto_approve.clone(),
         silent,
         ui.clone(),
         agent_env(&cfg.agent_cmd),
@@ -452,11 +465,15 @@ fn agents_cli(cfg: &Config) -> Result<()> {
     // One question, a switch, the same question again: the answers should come
     // from different agents while this process never restarts.
     let ui = Ui::terminal(&cfg.persona);
-    let silent = tts::Tts::spawn(tts::Engine::Off, Arc::new(AtomicBool::new(false)));
+    let silent = tts::Tts::spawn(
+        tts::Engine::Off,
+        Arc::new(AtomicBool::new(false)),
+        Ui::terminal(&cfg.persona),
+    );
     eprintln!("\n[1] 当前 agent: {}", cfg.agent_cmd.join(" "));
     let agent = AgentHandle::spawn(
         cfg.agent_cmd.clone(),
-        cfg.auto_approve,
+        cfg.auto_approve.clone(),
         silent,
         ui.clone(),
         agent_env(&cfg.agent_cmd),
@@ -489,7 +506,7 @@ fn run_with(cfg: &Config, ui: Ui, commands: Receiver<UiCommand>) -> Result<()> {
     // Spoken replies. The player owns the `muted` flag that the audio callback
     // honours, which is what keeps the assistant from hearing itself.
     let muted = Arc::new(AtomicBool::new(false));
-    let speaker = tts::Tts::spawn(cfg.tts_engine.clone(), muted.clone());
+    let speaker = tts::Tts::spawn(cfg.tts_engine.clone(), muted.clone(), ui.clone());
     if speaker.enabled() {
         eprintln!("[tts] 语音回复已开启 ({:?})", cfg.tts_engine);
     }
@@ -509,7 +526,7 @@ fn run_with(cfg: &Config, ui: Ui, commands: Receiver<UiCommand>) -> Result<()> {
     let launch = fallback_if_unusable(cfg, &ui);
     eprintln!("[acp] starting agent: {}", launch.join(" "));
     let env = agent_env(&launch);
-    let agent = AgentHandle::spawn(launch, cfg.auto_approve, speaker.clone(), ui.clone(), env);
+    let agent = AgentHandle::spawn(launch, cfg.auto_approve.clone(), speaker.clone(), ui.clone(), env);
 
     ui.ready(&cfg.wake_display);
 
@@ -607,7 +624,11 @@ fn run_with(cfg: &Config, ui: Ui, commands: Receiver<UiCommand>) -> Result<()> {
                         continue;
                     }
                     Ok(UiCommand::Tune(change)) => {
+                        let was_mode = tuning.agent_mode.clone();
                         tune(&mut tuning, change, &ui);
+                        if tuning.agent_mode != was_mode {
+                            apply_agent_mode(&tuning, cfg, &agent, &ui);
+                        }
                         continue;
                     }
                     // Key down in push-to-talk mode: record until it is released.
@@ -699,6 +720,31 @@ struct Conv {
 ///
 /// Only registry agents can be judged: a custom command is launched as written,
 /// since we know nothing about it.
+/// Make a permission-mode change real.
+///
+/// Three things have to move together, which is why this is not just a config
+/// write: the shared `auto_approve` flag (read per tool call, so it takes effect
+/// on the next one), kiro's allow-list file (`~/.kiro/agents/voice.json`, which
+/// decides what the agent itself will even attempt), and the launch argv (the
+/// `-a` flag lives on the command line). The last one needs a reconnect, which is
+/// the same hot-switch path used to change backends.
+fn apply_agent_mode(t: &Tuning, cfg: &Config, agent: &AgentHandle, ui: &Ui) {
+    cfg.auto_approve
+        .store(t.agent_mode == "full", Ordering::SeqCst);
+    if let Err(e) = setup::write_agent_config(&t.agent_mode, &cfg.persona) {
+        ui.error(format!("写 voice.json 失败: {e}"));
+    }
+    // Rebuild argv for whichever agent is configured; only kiro varies by mode,
+    // but relaunching is harmless for the others and keeps one code path.
+    if let Some(kind) = agents::id_of(&cfg.agent_cmd).and_then(agents::find) {
+        let argv = agents::argv(kind, &t.agent_mode);
+        agent.switch(argv.clone(), agent_env(&argv));
+    }
+    if t.agent_mode == "full" {
+        ui.error("full 模式：语音听错也会直接执行，慎用");
+    }
+}
+
 /// Credentials to hand the agent process, taken from ~/.voice-assistant/secrets.
 ///
 /// Only the variable the *selected* agent declares is passed, so a key for one
@@ -940,8 +986,10 @@ fn act(
 /// These are re-read on every loop iteration, so changing them takes effect at
 /// once. Anything needing a model reload (wake word, whisper size, language) is
 /// deliberately absent: those go to the config file and wait for a restart.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Tuning {
+    /// kiro-cli permission mode; also decides tool auto-approval.
+    agent_mode: String,
     /// True = hold a key to talk; false = always listening for the wake word.
     push_to_talk: bool,
     wake_threshold: f32,
@@ -953,6 +1001,7 @@ struct Tuning {
 impl Tuning {
     fn from(cfg: &Config) -> Self {
         Tuning {
+            agent_mode: cfg.agent_mode.clone(),
             push_to_talk: cfg.push_to_talk,
             wake_threshold: cfg.wake_threshold,
             silence_ms: cfg.silence_ms,
@@ -980,6 +1029,10 @@ fn tune(t: &mut Tuning, change: ui::Tunable, ui: &Ui) {
             t.no_speech_ms = v.clamp(1000.0, 300_000.0);
             format!("等待开口 = {:.0}ms", t.no_speech_ms)
         }
+        Tunable::AgentMode(mode) => {
+            t.agent_mode = mode;
+            format!("权限模式 = {}", t.agent_mode)
+        }
         Tunable::PushToTalk(on) => {
             t.push_to_talk = on;
             if on {
@@ -995,6 +1048,7 @@ fn tune(t: &mut Tuning, change: ui::Tunable, ui: &Ui) {
         s.silence_ms = t.silence_ms as u32;
         s.no_speech_ms = t.no_speech_ms as u32;
         s.listen_mode = if t.push_to_talk { "ptt".into() } else { "wake".into() };
+        s.agent_mode = t.agent_mode.clone();
         if let Err(e) = setup::save(&s) {
             ui.error(format!("已生效，但写入配置失败: {e}"));
         }
@@ -1252,7 +1306,7 @@ fn test_tts(cfg: &Config) -> Result<()> {
     };
 
     let muted = Arc::new(AtomicBool::new(false));
-    let speaker = tts::Tts::spawn(cfg.tts_engine.clone(), muted);
+    let speaker = tts::Tts::spawn(cfg.tts_engine.clone(), muted, Ui::terminal(&cfg.persona));
     let mut buf = tts::SpeechBuffer::default();
     println!("[tts] engine {:?}", cfg.tts_engine);
     // Simulate streaming: one char at a time, ~25ms apart.

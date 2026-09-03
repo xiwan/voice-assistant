@@ -26,6 +26,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use crossbeam_channel::{unbounded, Receiver};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::thread;
@@ -50,7 +51,10 @@ pub struct AcpConnection {
     active_prompt: Option<i64>,
     /// Approve tool-permission requests (the "full" trust mode); otherwise
     /// reject anything the launched agent's own allow-list didn't permit.
-    auto_approve: bool,
+    /// Shared and read per request, so changing the permission mode in the
+    /// settings panel applies to the very next tool call — no relaunch needed for
+    /// the *decision*, only for the flag kiro-cli takes on its command line.
+    auto_approve: Arc<AtomicBool>,
     /// Where progress goes. The connection no longer prints: it describes what
     /// happened and the front end decides how to show it.
     ui: Ui,
@@ -71,7 +75,7 @@ impl AcpConnection {
     /// up in a log line, an error message or a `ps` listing.
     pub fn connect(
         cmd: &[String],
-        auto_approve: bool,
+        auto_approve: Arc<AtomicBool>,
         tts: Tts,
         ui: Ui,
         env: &[(String, String)],
@@ -331,7 +335,8 @@ impl AcpConnection {
             // Voice has no interactive confirmation. In "full" mode we approve;
             // otherwise we reject anything the launched agent's own allow-list
             // did not already permit (so readonly/safe can't be escalated).
-            let want = if self.auto_approve { "allow" } else { "reject" };
+            let approve = self.auto_approve.load(Ordering::SeqCst);
+            let want = if approve { "allow" } else { "reject" };
             let picked = options.iter().find_map(|o| {
                 let kind = o.get("kind").or_else(|| o.get("name")).and_then(Value::as_str)?;
                 if kind.contains(want) {
@@ -340,8 +345,7 @@ impl AcpConnection {
                     None
                 }
             });
-            let verdict = self.auto_approve;
-            self.ui.tool(&tool, ToolState::Permission { approved: verdict });
+            self.ui.tool(&tool, ToolState::Permission { approved: approve });
             match picked {
                 Some(opt) => json!({ "outcome": { "outcome": "selected", "optionId": opt } }),
                 None => json!({ "outcome": { "outcome": "cancelled" } }),

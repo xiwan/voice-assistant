@@ -25,6 +25,8 @@ use crate::acp::{AcpConnection, Incoming};
 use crate::tts::Tts;
 use crate::ui::Ui;
 use crossbeam_channel::{select, unbounded, Receiver, RecvTimeoutError, Sender};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -72,7 +74,7 @@ impl AgentHandle {
     /// attached (terminal or window) instead of being printed here.
     pub fn spawn(
         cmd: Vec<String>,
-        auto_approve: bool,
+        auto_approve: Arc<AtomicBool>,
         tts: Tts,
         ui: Ui,
         env: Vec<(String, String)>,
@@ -111,7 +113,7 @@ enum Exit {
 
 fn supervisor(
     cmd: Vec<String>,
-    auto_approve: bool,
+    auto_approve: Arc<AtomicBool>,
     tts: Tts,
     ui: Ui,
     env: Vec<(String, String)>,
@@ -125,7 +127,7 @@ fn supervisor(
     const MAX_LAUNCH_FAILS: u32 = 3;
     let mut fails = 0u32;
     loop {
-        match AcpConnection::connect(&cmd, auto_approve, tts.clone(), ui.clone(), &env) {
+        match AcpConnection::connect(&cmd, auto_approve.clone(), tts.clone(), ui.clone(), &env) {
             Ok((mut conn, incoming)) => {
                 backoff = BACKOFF_START; // healthy connection resets backoff
                 fails = 0;
