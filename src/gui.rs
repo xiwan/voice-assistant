@@ -179,6 +179,14 @@ struct App {
     agent_states: Vec<(&'static agents::Kind, agents::State)>,
     silence_ms: f32,
     no_speech_ms: f32,
+    /// Hold-to-talk instead of the wake word.
+    push_to_talk: bool,
+    /// The key held to talk, and whether we are waiting for the user to press a
+    /// replacement.
+    ptt_key: egui::Key,
+    rebinding: bool,
+    /// Last key state sent, so `Talk` is emitted on edges only.
+    talk_down: bool,
 }
 
 impl App {
@@ -218,6 +226,10 @@ impl App {
             agent_states: Vec::new(),
             silence_ms: cfg.silence_ms,
             no_speech_ms: cfg.no_speech_ms,
+            push_to_talk: cfg.push_to_talk,
+            ptt_key: egui::Key::from_name(&cfg.ptt_key).unwrap_or(egui::Key::Space),
+            rebinding: false,
+            talk_down: false,
         };
         app.refresh_agents();
         app
@@ -227,6 +239,50 @@ impl App {
     /// demand (opening the panel) instead of every frame.
     fn refresh_agents(&mut self) {
         self.agent_states = agents::KINDS.iter().map(|k| (k, agents::state(k))).collect();
+    }
+
+    /// Watch the talk key and report only its *edges*, so the pipeline gets one
+    /// press and one release rather than a command per frame.
+    ///
+    /// While rebinding, the next key pressed becomes the binding instead of
+    /// talking. Typing in the text box must not transmit, so the whole thing is
+    /// skipped when a widget wants keyboard input.
+    fn poll_talk_key(&mut self, ctx: &egui::Context) {
+        if self.rebinding {
+            let picked = ctx.input(|i| {
+                i.events.iter().find_map(|e| match e {
+                    egui::Event::Key { key, pressed: true, .. } => Some(*key),
+                    _ => None,
+                })
+            });
+            if let Some(key) = picked {
+                if key != egui::Key::Escape {
+                    self.ptt_key = key;
+                    self.rows
+                        .push(Row::Notice(format!("按键已改为 {}", key.name())));
+                    self.persist_ptt_key();
+                }
+                self.rebinding = false;
+            }
+            return;
+        }
+        if !self.push_to_talk {
+            return;
+        }
+        let typing = ctx.egui_wants_keyboard_input();
+        let down = !typing && ctx.input(|i| i.key_down(self.ptt_key));
+        if down != self.talk_down {
+            self.talk_down = down;
+            self.send(UiCommand::Talk(down));
+        }
+    }
+
+    /// The key binding is UI-only state, so the window owns writing it.
+    fn persist_ptt_key(&self) {
+        if let Some(mut s) = crate::setup::load() {
+            s.ptt_key = self.ptt_key.name().to_string();
+            let _ = crate::setup::save(&s);
+        }
     }
 
     fn send(&self, cmd: UiCommand) {
@@ -532,6 +588,39 @@ impl App {
         }
 
         ui.add_space(10.0);
+        ui.heading("怎么开始听");
+        // Mode first, key second: the key is meaningless in wake-word mode.
+        let mut mode = self.push_to_talk;
+        ui.horizontal(|ui| {
+            if ui.radio_value(&mut mode, false, "常听（唤醒词）").clicked()
+                | ui.radio_value(&mut mode, true, "按住说话").clicked()
+            {
+                self.push_to_talk = mode;
+                self.send(UiCommand::Tune(Tunable::PushToTalk(mode)));
+            }
+        });
+        if self.push_to_talk {
+            ui.horizontal(|ui| {
+                ui.weak("按键");
+                if self.rebinding {
+                    // The next key press becomes the binding; handled in `ui()`
+                    // where the raw events are available.
+                    ui.strong("按一个键…");
+                    if ui.button("取消").clicked() {
+                        self.rebinding = false;
+                    }
+                } else {
+                    ui.strong(self.ptt_key.name());
+                    if ui.button("改键").clicked() {
+                        self.rebinding = true;
+                    }
+                }
+            });
+            ui.weak("按住说、松开结束。只在这个窗口有焦点时生效——");
+            ui.weak("全局热键需要额外依赖和系统辅助功能授权，还没做。");
+        }
+
+        ui.add_space(10.0);
         ui.heading("需重启生效");
         ui.weak("唤醒词 / 识别语言 / whisper 模型 / 语音引擎 —— 这些要重新加载模型，");
         ui.weak("目前仍在 `voice-assistant setup` 里改，改完重启进程。");
@@ -654,6 +743,7 @@ fn agent_icon(ui: &mut egui::Ui, id: &str, color: egui::Color32) {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.drain();
+        self.poll_talk_key(ui.ctx());
         // 0.36 merged SidePanel/TopBottomPanel into one `Panel` type, and panels
         // now take `&mut Ui` rather than `&Context` — most tutorials online show
         // the older API.

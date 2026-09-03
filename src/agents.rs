@@ -33,6 +33,19 @@ pub struct Kind {
     pub adapter_pkg: Option<&'static str>,
     /// How the underlying CLI gets installed.
     pub install: Install,
+    /// Some agents expose ACP as a *profile* of their own CLI rather than as a
+    /// separate binary. dsh is one: `dsh --profile acp` fails with
+    /// `profile "acp" does not exist` until the bundle is added, so having the
+    /// CLI on PATH is not enough to call the agent usable.
+    pub profile: Option<Profile>,
+}
+
+/// An ACP entry point that lives inside the agent's own CLI.
+pub struct Profile {
+    /// Path under $HOME that exists once the profile is provisioned.
+    pub marker: &'static str,
+    /// Command that provisions it.
+    pub install: &'static [&'static str],
 }
 
 /// Whether this program can install the agent's CLI itself.
@@ -83,6 +96,7 @@ pub const KINDS: &[Kind] = &[
         adapter_bin: None,
         adapter_pkg: None,
         install: Install::Manual("从 https://kiro.dev 下载安装，然后 kiro-cli login"),
+        profile: None,
     },
     Kind {
         id: "claude",
@@ -91,6 +105,7 @@ pub const KINDS: &[Kind] = &[
         adapter_bin: Some("claude-agent-acp"),
         adapter_pkg: Some("@agentclientprotocol/claude-agent-acp"),
         install: Install::Npm("@anthropic-ai/claude-code"),
+        profile: None,
     },
     Kind {
         id: "codex",
@@ -99,6 +114,7 @@ pub const KINDS: &[Kind] = &[
         adapter_bin: Some("codex-acp"),
         adapter_pkg: Some("@agentclientprotocol/codex-acp"),
         install: Install::Npm("@openai/codex"),
+        profile: None,
     },
     Kind {
         id: "deepseek",
@@ -111,6 +127,18 @@ pub const KINDS: &[Kind] = &[
         adapter_bin: None,
         adapter_pkg: None,
         install: Install::Npm("@deepseek-ai/dsh"),
+        // Verified by running it: without this the launch dies during initialize.
+        profile: Some(Profile {
+            marker: ".dsh/profiles/acp",
+            install: &[
+                "dsh",
+                "plugin",
+                "--profile",
+                "acp",
+                "add",
+                "@deepseek-ai/dsh-acp-app",
+            ],
+        }),
     },
 ];
 
@@ -149,12 +177,26 @@ pub fn find(id: &str) -> Option<&'static Kind> {
 }
 
 pub fn state(k: &Kind) -> State {
-    state_with(k, setup::which_on_path)
+    state_with(k, setup::which_on_path, |rel| setup::home().join(rel).exists())
 }
 
-pub fn state_with(k: &Kind, on_path: impl Fn(&str) -> bool) -> State {
+/// `home_has` answers "does this path exist under $HOME", kept as a parameter for
+/// the same reason as `on_path`: so the profile branch is testable anywhere.
+pub fn state_with(
+    k: &Kind,
+    on_path: impl Fn(&str) -> bool,
+    home_has: impl Fn(&str) -> bool,
+) -> State {
     if !on_path(k.cli) {
         return State::NeedsCli;
+    }
+    if let Some(pf) = &k.profile {
+        // The CLI is here but its ACP profile may not be provisioned yet.
+        return if home_has(pf.marker) {
+            State::Ready
+        } else {
+            State::NeedsAdapter
+        };
     }
     match k.adapter_bin {
         None => State::Ready, // the CLI speaks ACP itself
@@ -226,6 +268,9 @@ pub fn id_of(argv: &[String]) -> Option<&'static str> {
 /// Command that installs the *adapter* globally, if this agent needs one.
 /// Returned for display; the caller decides whether to run it.
 pub fn install_argv(k: &Kind) -> Option<Vec<String>> {
+    if let Some(pf) = &k.profile {
+        return Some(pf.install.iter().map(|s| s.to_string()).collect());
+    }
     k.adapter_pkg.map(|pkg| {
         vec![
             "npm".to_string(),
@@ -265,7 +310,7 @@ mod tests {
         let k = find("claude").unwrap();
         // The adapter alone cannot talk to a CLI that isn't there.
         assert_eq!(
-            state_with(k, path(&["claude-agent-acp", "npx"])),
+            state_with(k, path(&["claude-agent-acp", "npx"]), |_| true),
             State::NeedsCli
         );
     }
@@ -274,7 +319,7 @@ mod tests {
     fn installed_adapter_is_launched_directly() {
         let k = find("claude").unwrap();
         let p = path(&["claude", "claude-agent-acp", "npx"]);
-        assert_eq!(state_with(k, &p), State::Ready);
+        assert_eq!(state_with(k, &p, |_| true), State::Ready);
         assert_eq!(argv_with(k, "full", &p), vec!["claude-agent-acp"]);
     }
 
@@ -282,7 +327,7 @@ mod tests {
     fn npx_is_the_fallback_and_is_marked_as_slower() {
         let k = find("codex").unwrap();
         let p = path(&["codex", "npx"]);
-        assert_eq!(state_with(k, &p), State::ViaNpx);
+        assert_eq!(state_with(k, &p, |_| true), State::ViaNpx);
         assert_eq!(
             argv_with(k, "safe", &p),
             vec!["npx", "-y", "@agentclientprotocol/codex-acp"]
@@ -292,19 +337,20 @@ mod tests {
     #[test]
     fn without_npx_the_adapter_must_be_installed() {
         let k = find("codex").unwrap();
-        assert_eq!(state_with(k, path(&["codex"])), State::NeedsAdapter);
+        assert_eq!(state_with(k, path(&["codex"]), |_| true), State::NeedsAdapter);
         assert_eq!(
             install_argv(k).unwrap(),
             vec!["npm", "install", "-g", "@agentclientprotocol/codex-acp"]
         );
     }
 
-    /// Agents that speak ACP themselves must never be routed through npx.
+    /// Agents that speak ACP themselves must never be routed through npx — even
+    /// dsh, whose ACP lives in a profile of its own CLI.
     #[test]
     fn native_acp_agents_need_no_adapter() {
         for id in ["kiro", "deepseek"] {
             let k = find(id).unwrap();
-            assert!(install_argv(k).is_none(), "{id} should need no adapter");
+            assert!(k.adapter_pkg.is_none(), "{id} should need no npm adapter");
             let argv = argv_with(k, "safe", path(&[k.cli]));
             assert_eq!(argv[0], k.cli);
             assert!(!argv.contains(&"npx".to_string()), "{id}: {argv:?}");
@@ -354,6 +400,20 @@ mod tests {
             id_of(&v(&["npx", "-y", "@agentclientprotocol/claude-agent-acp@latest"])),
             Some("claude")
         );
+    }
+
+    /// A CLI on PATH is not enough when ACP lives in a profile: dsh dies with
+    /// `profile "acp" does not exist` until the bundle is added, which is exactly
+    /// what this used to report as 可用.
+    #[test]
+    fn a_profile_agent_needs_its_profile_provisioned() {
+        let k = find("deepseek").unwrap();
+        let p = path(&["dsh"]);
+        assert_eq!(state_with(k, &p, |_| false), State::NeedsAdapter);
+        assert_eq!(state_with(k, &p, |_| true), State::Ready);
+        let cmd = install_argv(k).unwrap();
+        assert_eq!(cmd[0], "dsh");
+        assert!(cmd.contains(&"@deepseek-ai/dsh-acp-app".to_string()), "{cmd:?}");
     }
 
     #[test]

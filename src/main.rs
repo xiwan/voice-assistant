@@ -36,7 +36,7 @@ use agent::{AgentHandle, AgentState};
 use anyhow::Result;
 use crossbeam_channel::{never, select, Receiver};
 use std::io::IsTerminal;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use ui::{Ui, UiCommand};
@@ -63,6 +63,10 @@ struct Config {
     persona: String,
     /// Spoken-output engine (off / say).
     tts_engine: tts::Engine,
+    /// Start listening by holding a key instead of saying the wake word.
+    push_to_talk: bool,
+    /// egui key name for that key (shown and rebound in the settings panel).
+    ptt_key: String,
     silence_ms: f32,
     no_speech_ms: f32,
     max_utterance_ms: f32,
@@ -124,6 +128,8 @@ impl Config {
                 &env("VA_TTS_CMD", &settings.tts_cmd),
                 &lang_for_tts,
             ),
+            push_to_talk: env("VA_LISTEN_MODE", &settings.listen_mode) == "ptt",
+            ptt_key: settings.ptt_key.clone(),
             silence_ms: env("VA_SILENCE_MS", &settings.silence_ms.to_string())
                 .parse()
                 .unwrap_or(1000.0),
@@ -481,9 +487,15 @@ fn run_with(cfg: &Config, ui: Ui, commands: Receiver<UiCommand>) -> Result<()> {
     // The agent runs under a supervisor thread: the main loop below never
     // blocks on a reply, so it can always hear the wake word — including
     // "Jarvis, 停" to interrupt a running task. Exactly one agent is kept alive.
-    eprintln!("[acp] starting agent: {}", cfg.agent_cmd.join(" "));
+    // A config can point at an agent that cannot start — it was installed and
+    // then its adapter went missing, or a switch was saved before the first
+    // launch failed. Without this the supervisor just crash-loops and the
+    // assistant is deaf. Fall back to something usable and say so; the config is
+    // left alone, because the user's choice is not ours to overwrite.
+    let launch = fallback_if_unusable(cfg, &ui);
+    eprintln!("[acp] starting agent: {}", launch.join(" "));
     let agent = AgentHandle::spawn(
-        cfg.agent_cmd.clone(),
+        launch,
         cfg.auto_approve,
         speaker.clone(),
         ui.clone(),
@@ -493,6 +505,9 @@ fn run_with(cfg: &Config, ui: Ui, commands: Receiver<UiCommand>) -> Result<()> {
 
     // Live-adjustable parameters, seeded from config and moved by the settings UI.
     let mut tuning = Tuning::from(cfg);
+    // Shared so the recording loop can watch the key without going through the
+    // command channel on every frame.
+    let talk_held = Arc::new(AtomicBool::new(false));
 
     // `Conv` holds the conversation state (busy / follow-up window / the running
     // task / a paused-and-resumable task).
@@ -571,6 +586,23 @@ fn run_with(cfg: &Config, ui: Ui, commands: Receiver<UiCommand>) -> Result<()> {
                         tune(&mut tuning, change, &ui);
                         continue;
                     }
+                    // Key down in push-to-talk mode: record until it is released.
+                    // Handled here rather than by `act` because it starts a
+                    // recording instead of dispatching an intent.
+                    Ok(UiCommand::Talk(down)) => {
+                        talk_held.store(down, Ordering::SeqCst);
+                        if down && tuning.push_to_talk {
+                            speaker.stop(); // talking over the reply means barge-in
+                            ui.notice("在听（按住）…");
+                            match record_while_held(&rx, &talk_held, &tuning)? {
+                                Some(audio) => handle_command(
+                                    audio, &asr, &agent, &speaker, &ui, &mut conv,
+                                ),
+                                None => ui.notice("太短了，没听到内容"),
+                            }
+                        }
+                        continue;
+                    }
                     Ok(UiCommand::InstallAdapter(id)) => {
                         install(&id, false, &ui);
                         continue;
@@ -587,6 +619,11 @@ fn run_with(cfg: &Config, ui: Ui, commands: Receiver<UiCommand>) -> Result<()> {
                 }
             }
         };
+        // In push-to-talk mode the audio is still drained (a full channel would
+        // stall everything) but the wake detector is idle: the key is the gate.
+        if tuning.push_to_talk {
+            continue;
+        }
         let Some(score) = wake.feed(&chunk)? else {
             continue;
         };
@@ -631,6 +668,37 @@ struct Conv {
     current_task: Option<String>,
     /// A paused task, resumed by "继续". Sticky: survives interjections.
     resumable: Option<String>,
+}
+
+/// Return the agent command to launch, substituting a working agent when the
+/// configured one is known to be unusable.
+///
+/// Only registry agents can be judged: a custom command is launched as written,
+/// since we know nothing about it.
+fn fallback_if_unusable(cfg: &Config, ui: &Ui) -> Vec<String> {
+    let Some(kind) = agents::id_of(&cfg.agent_cmd).and_then(agents::find) else {
+        return cfg.agent_cmd.clone(); // custom command: not ours to second-guess
+    };
+    let state = agents::state(kind);
+    if state.usable() {
+        return cfg.agent_cmd.clone();
+    }
+    match agents::KINDS.iter().find(|k| agents::state(k).usable()) {
+        Some(alt) => {
+            ui.error(format!(
+                "{} 现在不可用（{}），先用 {} 顶上",
+                kind.label,
+                state.label(),
+                alt.label
+            ));
+            if let Some(fix) = agents::install_argv(kind) {
+                ui.notice(format!("修好它: {}", fix.join(" ")));
+            }
+            agents::argv(alt, &cfg.agent_mode)
+        }
+        // Nothing usable at all: launch as configured so the real error shows.
+        None => cfg.agent_cmd.clone(),
+    }
 }
 
 /// Swap the running agent for another one from the registry.
@@ -694,7 +762,7 @@ fn install(id: &str, cli: bool, ui: &Ui) {
     ui.notice(format!("正在安装: {}（可能要几十秒）", cmd.join(" ")));
     let ui = ui.clone();
     let label = kind.label.to_string();
-    let what = if cli { "CLI" } else { "适配器" };
+    let what = if cli { "CLI" } else { "ACP 适配器/profile" };
     std::thread::spawn(move || {
         match std::process::Command::new(&cmd[0]).args(&cmd[1..]).output() {
             Ok(out) if out.status.success() => ui.notice(format!(
@@ -707,7 +775,7 @@ fn install(id: &str, cli: bool, ui: &Ui) {
                 let tail = err.lines().rev().take(2).collect::<Vec<_>>().join(" ");
                 ui.error(format!("{label} {what} 安装失败: {}", ui::truncate(&tail)));
             }
-            Err(e) => ui.error(format!("无法执行 npm: {e}")),
+            Err(e) => ui.error(format!("无法执行 {}: {e}", cmd[0])),
         }
     });
 }
@@ -751,7 +819,10 @@ fn from_command(cmd: UiCommand) -> (Intent, String) {
         // conservative reading (do not leave a task running against an agent
         // that is being replaced, or through a settings change).
         UiCommand::SwitchAgent(_) => (Intent::Abandon, String::new()),
-        UiCommand::Tune(_) | UiCommand::InstallAdapter(_) | UiCommand::InstallCli(_) => {
+        UiCommand::Tune(_)
+        | UiCommand::InstallAdapter(_)
+        | UiCommand::InstallCli(_)
+        | UiCommand::Talk(_) => {
             (Intent::Abandon, String::new())
         }
     }
@@ -819,6 +890,8 @@ fn act(
 /// deliberately absent: those go to the config file and wait for a restart.
 #[derive(Clone, Copy)]
 struct Tuning {
+    /// True = hold a key to talk; false = always listening for the wake word.
+    push_to_talk: bool,
     wake_threshold: f32,
     silence_ms: f32,
     no_speech_ms: f32,
@@ -828,6 +901,7 @@ struct Tuning {
 impl Tuning {
     fn from(cfg: &Config) -> Self {
         Tuning {
+            push_to_talk: cfg.push_to_talk,
             wake_threshold: cfg.wake_threshold,
             silence_ms: cfg.silence_ms,
             no_speech_ms: cfg.no_speech_ms,
@@ -854,16 +928,58 @@ fn tune(t: &mut Tuning, change: ui::Tunable, ui: &Ui) {
             t.no_speech_ms = v.clamp(1000.0, 300_000.0);
             format!("等待开口 = {:.0}ms", t.no_speech_ms)
         }
+        Tunable::PushToTalk(on) => {
+            t.push_to_talk = on;
+            if on {
+                "已切到按键说话（按住说，松开结束）".to_string()
+            } else {
+                "已切回常听模式（说唤醒词开始）".to_string()
+            }
+        }
     };
     ui.notice(what);
     if let Some(mut s) = setup::load() {
         s.threshold = t.wake_threshold;
         s.silence_ms = t.silence_ms as u32;
         s.no_speech_ms = t.no_speech_ms as u32;
+        s.listen_mode = if t.push_to_talk { "ptt".into() } else { "wake".into() };
         if let Err(e) = setup::save(&s) {
             ui.error(format!("已生效，但写入配置失败: {e}"));
         }
     }
+}
+
+/// Record for exactly as long as the talk key is held.
+///
+/// No VAD endpointing here on purpose: the user's finger *is* the endpoint, and
+/// running the VAD would cut them off mid-pause. `max_utterance_ms` still applies
+/// as a runaway guard (a stuck key must not record forever). Audio keeps being
+/// consumed either way, because a full capture channel stalls the whole pipeline.
+fn record_while_held(
+    rx: &Receiver<Vec<i16>>,
+    held: &Arc<AtomicBool>,
+    t: &Tuning,
+) -> Result<Option<Vec<i16>>> {
+    let mut audio: Vec<i16> = Vec::new();
+    let mut total_ms = 0f32;
+    while held.load(Ordering::SeqCst) {
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(chunk) => {
+                total_ms += chunk.len() as f32 * 1000.0 / 16000.0;
+                audio.extend_from_slice(&chunk);
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => total_ms += 200.0,
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                anyhow::bail!("audio capture stopped (input device gone?)")
+            }
+        }
+        if total_ms >= t.max_utterance_ms {
+            break;
+        }
+    }
+    // Too short to be speech: a stray tap should not reach the agent.
+    let ms = audio.len() as f32 * 1000.0 / 16000.0;
+    Ok(if ms >= 250.0 { Some(audio) } else { None })
 }
 
 /// Record until the speaker stops talking (VAD-based endpointing).

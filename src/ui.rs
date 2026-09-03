@@ -117,6 +117,9 @@ pub enum UiCommand {
     InstallAdapter(String),
     /// Install the agent's own CLI, for the npm-distributed ones.
     InstallCli(String),
+    /// Push-to-talk key state: `true` on press, `false` on release. Ignored in
+    /// wake-word mode.
+    Talk(bool),
     /// Shut the pipeline down.
     Quit,
 }
@@ -131,6 +134,8 @@ pub enum Tunable {
     SilenceMs(f32),
     /// How long to wait for speech to start before giving up, ms.
     NoSpeechMs(f32),
+    /// Switch between always-listening (wake word) and hold-to-talk.
+    PushToTalk(bool),
 }
 
 /// Handle the pipeline holds. Cloneable and `Send`, because the ACP supervisor

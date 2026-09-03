@@ -62,6 +62,10 @@ pub struct Settings {
     /// Sidecar command for tts="cmd": reads reply text on stdin, synthesizes
     /// and plays it, exits when done (e.g. a Kokoro/Piper wrapper).
     pub tts_cmd: String,
+    /// How listening starts: "wake" (always on, wake word) or "ptt" (hold a key).
+    pub listen_mode: String,
+    /// egui key name held down to talk in "ptt" mode (see `egui::Key::name`).
+    pub ptt_key: String,
 }
 
 impl Default for Settings {
@@ -80,6 +84,8 @@ impl Default for Settings {
             tts_voice: String::new(),
             tts_rate: 0,
             tts_cmd: String::new(),
+            listen_mode: "wake".into(),
+            ptt_key: "Space".into(),
         }
     }
 }
@@ -191,6 +197,8 @@ pub fn load() -> Option<Settings> {
             "tts_voice" => s.tts_voice = v.into(),
             "tts_rate" => s.tts_rate = v.parse().unwrap_or(0),
             "tts_cmd" => s.tts_cmd = v.into(),
+            "listen_mode" => s.listen_mode = v.into(),
+            "ptt_key" => s.ptt_key = v.into(),
             _ => {}
         }
     }
@@ -204,7 +212,8 @@ pub fn save(s: &Settings) -> Result<()> {
         format!(
             "wake_word={}\nlang={}\nwhisper={}\nthreshold={}\nagent_cmd={}\n\
              agent_mode={}\nsilence_ms={}\nno_speech_ms={}\nmax_utterance_ms={}\n\
-             tts={}\ntts_voice={}\ntts_rate={}\ntts_cmd={}\n",
+             tts={}\ntts_voice={}\ntts_rate={}\ntts_cmd={}\n\
+             listen_mode={}\nptt_key={}\n",
             s.wake_word,
             s.lang,
             s.whisper,
@@ -217,7 +226,9 @@ pub fn save(s: &Settings) -> Result<()> {
             s.tts,
             s.tts_voice,
             s.tts_rate,
-            s.tts_cmd
+            s.tts_cmd,
+            s.listen_mode,
+            s.ptt_key
         ),
     )?;
     Ok(())
@@ -410,6 +421,10 @@ pub fn interactive_setup(existing: Option<Settings>) -> Result<Settings> {
         tts_voice,
         tts_rate,
         tts_cmd,
+        // Listening mode and its key live in the window's settings panel, not in
+        // this terminal wizard: they are pointless without somewhere to press.
+        listen_mode: cur.listen_mode.clone(),
+        ptt_key: cur.ptt_key.clone(),
     };
     save(&settings)?;
     println!("\n已保存到 {} (随时可用 `voice-assistant setup` 修改)\n", config_path().display());
