@@ -76,6 +76,11 @@ pub struct AcpConnection {
     /// be reloaded. Prefixing costs no extra round trip and makes the agent say
     /// nothing the user did not ask for.
     pending_recap: Option<String>,
+    /// Whether to wait for a clean exit when this connection is dropped. Waiting
+    /// only buys something when the session could be loaded again, i.e. when the
+    /// *same* backend is coming back; switching to a different agent can never
+    /// reuse this session id, so waiting would be pure latency.
+    graceful: bool,
 }
 
 impl AcpConnection {
@@ -128,6 +133,7 @@ impl AcpConnection {
             store,
             replaying: false,
             pending_recap: None,
+            graceful: true,
         };
         // A backend that dies on startup usually explains itself on stderr, but
         // the explanation can land a moment after the pipe closes — hence the
@@ -146,9 +152,21 @@ impl AcpConnection {
         Ok((c, incoming, recovered))
     }
 
+    /// `false` = drop without waiting for a clean exit. Set before replacing this
+    /// connection with a *different* backend: the session id is private to the
+    /// agent that issued it, so preserving its lock helps nobody and the user is
+    /// left waiting (measured: ~4s for kiro-cli).
+    pub fn set_graceful(&mut self, graceful: bool) {
+        self.graceful = graceful;
+    }
+
     /// `initialize`, then continue the conversation the best way this backend
     /// allows: reload its own session, or start a new one seeded with a recap.
     fn handshake(&mut self, incoming: &Receiver<Incoming>, argv: &str) -> Result<Recovery> {
+        // Handshakes are slow enough to look like a hang: measured 4.3s for
+        // kiro-cli (3.2s initialize + 1.1s session/new) and 1.9s for dsh. Report
+        // each stage so a front end can show progress instead of nothing.
+        self.ui.progress("正在和 agent 握手…");
         let init = self.request_blocking(
             incoming,
             "initialize",
@@ -174,6 +192,7 @@ impl AcpConnection {
         };
 
         if let Plan::Load(id) = &plan {
+            self.ui.progress("正在接回上次的会话…");
             match self.load_session(incoming, id, &cwd) {
                 Ok(()) => {
                     self.session_id = id.clone();
@@ -191,6 +210,7 @@ impl AcpConnection {
             }
         }
 
+        self.ui.progress("正在建立会话…");
         let newsess =
             self.request_blocking(incoming, "session/new", json!({ "cwd": cwd, "mcpServers": [] }))?;
         self.session_id = newsess
@@ -471,9 +491,13 @@ impl AcpConnection {
 }
 
 /// How long a replaced agent gets to exit on its own after stdin is closed.
-/// Generous enough for a clean exit, short enough that a wedged backend does not
-/// delay the replacement the user is waiting for.
-const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+///
+/// Measured (`scratch/time_handshake.py`): kiro-cli 2.21.0 takes ~4s to exit on
+/// EOF, dsh ~0.07s. The first version of this used 2s, which meant kiro was always
+/// killed before it finished — leaving exactly the stale session lock this wait
+/// exists to avoid. Sized off the slow one, and skipped entirely when the wait
+/// cannot buy anything (see `set_graceful`).
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(6);
 
 impl Drop for AcpConnection {
     fn drop(&mut self) {
@@ -488,6 +512,12 @@ impl Drop for AcpConnection {
         // no longer exists, and that lock never expires — the session is then
         // unloadable forever and continuity has to fall back to a recap.
         drop(self.stdin.take());
+        if !self.graceful {
+            // Nothing to preserve: kill now rather than making the user wait.
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            return;
+        }
         let deadline = Instant::now() + SHUTDOWN_GRACE;
         while Instant::now() < deadline {
             match self.child.try_wait() {

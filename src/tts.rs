@@ -206,6 +206,10 @@ enum Cmd {
     /// already in flight when the user says "停" are discarded.
     Say(String, u64),
     Stop,
+    /// Replace the synthesizer between utterances. This is what makes the engine
+    /// changeable from the settings panel: `Off` is an engine like any other, so
+    /// turning replies on and off is a swap rather than a thread lifecycle.
+    SetEngine(Engine),
     Shutdown,
 }
 
@@ -218,6 +222,10 @@ pub struct Tts {
     pending: Arc<AtomicUsize>,
     /// Bumped by `stop()` to invalidate everything queued so far.
     epoch: Arc<AtomicU64>,
+    /// Whether the *current* engine speaks. Shared rather than derived from the
+    /// channel, because the engine can be swapped at runtime and a front end must
+    /// see the live state, not the one this handle was created with.
+    enabled: Arc<AtomicBool>,
 }
 
 impl Tts {
@@ -227,24 +235,38 @@ impl Tts {
     /// `ui` is how the player reports that it started or stopped talking. It is the
     /// only place that knows: the mute flag and the "speaking" light are the same
     /// fact, so they are set together rather than inferred separately.
+    ///
+    /// The thread starts even when the engine is `Off`: it costs an idle thread and
+    /// it is what allows replies to be switched on later without a restart.
     pub fn spawn(engine: Engine, muted: Arc<AtomicBool>, ui: crate::ui::Ui) -> Self {
         let pending = Arc::new(AtomicUsize::new(0));
         let epoch = Arc::new(AtomicU64::new(0));
-        if !engine.enabled() {
-            return Self { tx: None, pending, epoch };
-        }
+        let enabled = Arc::new(AtomicBool::new(engine.enabled()));
         let (tx, rx) = unbounded::<Cmd>();
         let (p, e) = (pending.clone(), epoch.clone());
         thread::spawn(move || player(engine, rx, p, e, muted, ui));
-        Self { tx: Some(tx), pending, epoch }
+        Self { tx: Some(tx), pending, epoch, enabled }
     }
 
     pub fn enabled(&self) -> bool {
-        self.tx.is_some()
+        self.enabled.load(Ordering::SeqCst)
     }
 
-    /// Queue one utterance (non-blocking).
+    /// Swap the synthesizer. Takes effect on the next utterance; anything already
+    /// playing is left alone (the caller decides whether to `stop()` first).
+    pub fn set_engine(&self, engine: Engine) {
+        self.enabled.store(engine.enabled(), Ordering::SeqCst);
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(Cmd::SetEngine(engine));
+        }
+    }
+
+    /// Queue one utterance (non-blocking). Silent engines drop it here rather than
+    /// in the player, so a disabled engine does not log one error per sentence.
     pub fn say(&self, text: impl Into<String>) {
+        if !self.enabled() {
+            return;
+        }
         if let Some(tx) = &self.tx {
             let epoch = self.epoch.load(Ordering::SeqCst);
             self.pending.fetch_add(1, Ordering::SeqCst);
@@ -286,6 +308,9 @@ fn player(
     muted: Arc<AtomicBool>,
     ui: crate::ui::Ui,
 ) {
+    // Owned mutably: the settings panel can replace the synthesizer while the
+    // assistant is running.
+    let mut engine = engine;
     let mut queue: VecDeque<(String, u64)> = VecDeque::new();
     loop {
         // Idle: wait for work.
@@ -293,6 +318,7 @@ fn player(
             match rx.recv() {
                 Ok(Cmd::Say(t, g)) => queue.push_back((t, g)),
                 Ok(Cmd::Stop) => {}
+                Ok(Cmd::SetEngine(next)) => engine = next,
                 Ok(Cmd::Shutdown) | Err(_) => {
                     set_speaking(&muted, &ui, false);
                     return;
@@ -302,6 +328,12 @@ fn player(
         };
         // Stale utterance (queued before a stop): drop without speaking.
         if gen != epoch.load(Ordering::SeqCst) {
+            continue;
+        }
+        // A disabled engine has nothing to say. `say()` already filters this, so
+        // reaching here means the engine was switched off while text was queued.
+        if !engine.enabled() {
+            done(&pending, &queue, &muted, &ui);
             continue;
         }
 
@@ -324,6 +356,9 @@ fn player(
             }
             match rx.recv_timeout(POLL) {
                 Ok(Cmd::Say(t, g)) => queue.push_back((t, g)),
+                // Applies to the next utterance: cutting the current sentence in
+                // half because a setting changed would be worse than finishing it.
+                Ok(Cmd::SetEngine(next)) => engine = next,
                 Ok(Cmd::Stop) => {
                     let _ = child.kill();
                     let _ = child.wait();
@@ -596,6 +631,50 @@ mod tests {
         b.push("半句话");
         b.reset();
         assert!(b.flush().is_none());
+    }
+
+    /// The panel has to be able to turn replies on after starting with them off.
+    /// Before v0.22.0 that was structurally impossible: a disabled engine meant no
+    /// player thread and `enabled()` read the channel, so it answered "off"
+    /// forever. Nothing is spoken here — only the reported state is checked.
+    #[test]
+    fn the_engine_can_be_swapped_while_running() {
+        let tts = Tts::spawn(
+            Engine::Off,
+            Arc::new(AtomicBool::new(false)),
+            crate::ui::Ui::channel().0,
+        );
+        assert!(!tts.enabled(), "starts off");
+
+        tts.set_engine(Engine::Say { voice: Some("Tingting".into()), rate: None });
+        assert!(tts.enabled(), "turning it on must be visible immediately");
+
+        tts.set_engine(Engine::Off);
+        assert!(!tts.enabled(), "and off again");
+        tts.shutdown();
+    }
+
+    /// A silent engine must swallow text at the handle, not in the player: the
+    /// player would log one error per sentence. (`disabled_engine_is_inert` covers
+    /// the mic-mute half of this.)
+    ///
+    /// The rest of `resolve` is covered by `engine_resolves_chinese_voice_by_default`;
+    /// what the panel adds is an explicit voice, an explicit rate, and a sidecar
+    /// that may be empty.
+    #[test]
+    fn panel_settings_resolve_to_an_engine() {
+        match Engine::resolve("say", "Meijia", 220, "", "zh") {
+            Engine::Say { voice, rate } => {
+                assert_eq!(voice.as_deref(), Some("Meijia"));
+                assert_eq!(rate, Some(220));
+            }
+            other => panic!("expected Say, got {other:?}"),
+        }
+        // "cmd" with nothing to run is off rather than a broken engine.
+        assert!(!Engine::resolve("cmd", "", 0, "   ", "zh").enabled());
+        assert!(Engine::resolve("cmd", "", 0, "python3 say.py", "zh").enabled());
+        // An engine of "off" ignores the other three fields entirely.
+        assert!(!Engine::resolve("off", "Tingting", 200, "", "zh").enabled());
     }
 
     #[test]

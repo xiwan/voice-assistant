@@ -26,6 +26,7 @@ mod agents;
 mod asr;
 mod audio;
 mod gui;
+mod models;
 mod session;
 mod setup;
 mod tts;
@@ -61,10 +62,20 @@ struct Config {
     auto_approve: Arc<AtomicBool>,
     /// kiro-cli permission mode (readonly/safe/full); used to refresh voice.json.
     agent_mode: String,
+    /// Model id for backends that accept one at launch; empty = their default.
+    model: String,
     /// Assistant persona name derived from the wake word (e.g. "Jarvis").
     persona: String,
     /// Spoken-output engine (off / say).
     tts_engine: tts::Engine,
+    /// The raw TTS settings the engine was resolved from. Kept because the panel
+    /// changes them one at a time and every change has to be re-resolved against
+    /// the others (a voice means nothing without an engine, and `resolve` is where
+    /// the language default lives).
+    tts_id: String,
+    tts_voice: String,
+    tts_rate: u32,
+    tts_cmd: String,
     /// Start listening by holding a key instead of saying the wake word.
     push_to_talk: bool,
     /// egui key name for that key (shown and rebound in the settings panel).
@@ -120,6 +131,7 @@ impl Config {
                 .collect(),
             auto_approve: Arc::new(AtomicBool::new(settings.agent_mode == "full")),
             agent_mode: settings.agent_mode.clone(),
+            model: env("VA_MODEL", &settings.model),
             persona: setup::persona_name(&settings.wake_word),
             tts_engine: tts::Engine::resolve(
                 &env("VA_TTS", &settings.tts),
@@ -130,6 +142,12 @@ impl Config {
                 &env("VA_TTS_CMD", &settings.tts_cmd),
                 &lang_for_tts,
             ),
+            tts_id: env("VA_TTS", &settings.tts),
+            tts_voice: env("VA_TTS_VOICE", &settings.tts_voice),
+            tts_rate: env("VA_TTS_RATE", &settings.tts_rate.to_string())
+                .parse()
+                .unwrap_or(settings.tts_rate),
+            tts_cmd: env("VA_TTS_CMD", &settings.tts_cmd),
             push_to_talk: env("VA_LISTEN_MODE", &settings.listen_mode) == "ptt",
             ptt_key: settings.ptt_key.clone(),
             silence_ms: env("VA_SILENCE_MS", &settings.silence_ms.to_string())
@@ -222,11 +240,17 @@ fn start_capture_unmuted() -> Result<(audio::Capture, Receiver<Vec<i16>>)> {
     start_capture(Arc::new(AtomicBool::new(false)))
 }
 
+/// Is the configured agent the managed kiro-cli one? Only kiro reads
+/// ~/.kiro/agents/voice.json; custom ACP backends manage their own persona.
+fn is_kiro(cfg: &Config) -> bool {
+    cfg.agent_cmd.first().map(|s| s == "kiro-cli").unwrap_or(false)
+}
+
 /// For the kiro backend, regenerate ~/.kiro/agents/voice.json so the agent's
 /// identity always matches the current wake word (the wake word is its name).
 /// No-op for custom ACP backends, which manage their own persona.
 fn sync_persona(cfg: &Config) {
-    if cfg.agent_cmd.first().map(|s| s == "kiro-cli").unwrap_or(false) {
+    if is_kiro(cfg) {
         if let Err(e) = setup::write_agent_config(&cfg.agent_mode, &cfg.persona) {
             eprintln!("[setup] warning: could not refresh voice.json: {e}");
         }
@@ -475,7 +499,7 @@ fn agents_cli(cfg: &Config) -> Result<()> {
     for k in agents::KINDS {
         let st = agents::state(k);
         println!("[{}] {} — {}", if st.usable() { "ok" } else { "!!" }, k.label, st.label());
-        println!("    启动: {}", agents::argv(k, &cfg.agent_mode).join(" "));
+        println!("    启动: {}", launch_argv(k, &cfg.agent_mode, &cfg.model).join(" "));
         match st {
             agents::State::NeedsCli => println!("    安装 CLI: {}", k.install.hint()),
             agents::State::NeedsAdapter | agents::State::ViaNpx => {
@@ -524,7 +548,7 @@ fn agents_cli(cfg: &Config) -> Result<()> {
     agent.prompt(q.into());
     wait_for_idle(&agent);
 
-    let argv = agents::argv(kind, &cfg.agent_mode);
+    let argv = launch_argv(kind, &cfg.agent_mode, &cfg.model);
     eprintln!("\n[2] 热切换到 {}: {}", kind.label, argv.join(" "));
     agent.switch(argv.clone(), agent_env(&argv));
     agent.prompt(q.into());
@@ -595,9 +619,6 @@ fn run_with(cfg: &Config, ui: Ui, commands: Receiver<UiCommand>) -> Result<()> {
 
     // Live-adjustable parameters, seeded from config and moved by the settings UI.
     let mut tuning = Tuning::from(cfg);
-    // Shared so the recording loop can watch the key without going through the
-    // command channel on every frame.
-    let talk_held = Arc::new(AtomicBool::new(false));
 
     // `Conv` holds the conversation state (busy / follow-up window / the running
     // task / a paused-and-resumable task).
@@ -704,28 +725,82 @@ fn run_with(cfg: &Config, ui: Ui, commands: Receiver<UiCommand>) -> Result<()> {
                         switch_agent(&id, &agent, &ui, cfg);
                         continue;
                     }
+                    Ok(UiCommand::ApplyAgentPrompt(text)) => {
+                        apply_agent_prompt(&text, &tuning, cfg, &agent, &ui);
+                        continue;
+                    }
                     Ok(UiCommand::Tune(change)) => {
                         let was_mode = tuning.agent_mode.clone();
-                        tune(&mut tuning, change, &ui);
+                        let was_ptt = tuning.push_to_talk;
+                        let relaunch = tune(&mut tuning, change, &ui, &speaker);
                         if tuning.agent_mode != was_mode {
                             apply_agent_mode(&tuning, cfg, &agent, &ui);
+                        } else if relaunch {
+                            // The model is a launch flag: the only way to apply it
+                            // is a relaunch of the same backend. Same argv means the
+                            // supervisor waits for a clean exit, so the session is
+                            // reloaded and the conversation survives the change.
+                            if let Some(kind) =
+                                agents::id_of(&cfg.agent_cmd).and_then(agents::find)
+                            {
+                                let argv = launch_argv(kind, &tuning.agent_mode, &tuning.model);
+                                ui.notice("重启 agent 以应用模型…");
+                                agent.switch(argv.clone(), agent_env(&argv));
+                            } else {
+                                ui.error("当前是自定义 agent 命令，模型请直接写在命令里");
+                            }
+                        }
+                        // Switching listening mode: the streaming wake detector
+                        // requires a gap-free stream, and in push-to-talk mode the
+                        // audio it needs was being discarded. Without this reset it
+                        // carries stale internal state back into wake mode and
+                        // appears deaf for a while.
+                        if tuning.push_to_talk != was_ptt {
+                            wake.reset();
+                            vad.reset();
+                        }
+                        continue;
+                    }
+                    // Judging a voice needs to hear it. Uses the same path a reply
+                    // takes, so what you hear is what the assistant will sound
+                    // like — including being interruptible.
+                    Ok(UiCommand::TtsPreview) => {
+                        if speaker.enabled() {
+                            let sample =
+                                "好的，我在。这是当前音色和语速的试听效果，说“停”可以随时打断我。";
+                            ui.spoken(sample);
+                            speaker.stop();
+                            speaker.say(sample);
+                        } else {
+                            ui.notice("语音回复是关闭状态，先选一个引擎再试听");
                         }
                         continue;
                     }
                     // Key down in push-to-talk mode: record until it is released.
                     // Handled here rather than by `act` because it starts a
-                    // recording instead of dispatching an intent.
+                    // recording instead of dispatching an intent. The release
+                    // arrives on this same channel, which is why the recorder is
+                    // given the channel instead of a shared flag.
                     Ok(UiCommand::Talk(down)) => {
-                        talk_held.store(down, Ordering::SeqCst);
                         if down && tuning.push_to_talk {
                             speaker.stop(); // talking over the reply means barge-in
                             ui.notice("在听（按住）…");
-                            match record_while_held(&rx, &talk_held, &tuning)? {
-                                Some(audio) => handle_command(
+                            match record_while_held(&rx, &commands, &tuning)? {
+                                Held::Audio(audio) => handle_command(
                                     audio, &asr, &agent, &speaker, &ui, &mut conv,
                                 ),
-                                None => ui.notice("太短了，没听到内容"),
+                                Held::TooShort => ui.notice("太短了，没听到内容"),
+                                Held::Quit => {
+                                    speaker.stop();
+                                    speaker.shutdown();
+                                    agent.shutdown();
+                                    return Ok(());
+                                }
                             }
+                            // The wake detector was starved while the key was
+                            // down; give it a clean stream to start from.
+                            wake.reset();
+                            vad.reset();
                         }
                         continue;
                     }
@@ -796,6 +871,16 @@ struct Conv {
     resumable: Option<String>,
 }
 
+/// The full launch argv: what the registry says about the backend, plus the model
+/// choice for the backends that take one. Kept in one place so a model set in the
+/// panel cannot be forgotten by one of the several paths that start an agent
+/// (startup, fallback, switch, permission-mode relaunch).
+fn launch_argv(kind: &'static agents::Kind, mode: &str, model: &str) -> Vec<String> {
+    let mut argv = agents::argv(kind, mode);
+    models::apply(&mut argv, kind.id, model);
+    argv
+}
+
 /// Return the agent command to launch, substituting a working agent when the
 /// configured one is known to be unusable.
 ///
@@ -818,11 +903,44 @@ fn apply_agent_mode(t: &Tuning, cfg: &Config, agent: &AgentHandle, ui: &Ui) {
     // Rebuild argv for whichever agent is configured; only kiro varies by mode,
     // but relaunching is harmless for the others and keeps one code path.
     if let Some(kind) = agents::id_of(&cfg.agent_cmd).and_then(agents::find) {
-        let argv = agents::argv(kind, &t.agent_mode);
+        let argv = launch_argv(kind, &t.agent_mode, &t.model);
         agent.switch(argv.clone(), agent_env(&argv));
     }
     if t.agent_mode == "full" {
         ui.error("full 模式：语音听错也会直接执行，慎用");
+    }
+}
+
+/// Apply a new agent system prompt from the settings panel.
+///
+/// An empty text, or text identical to the default template, means "no custom
+/// prompt" — clearing the custom file keeps the persona name following the wake
+/// word (saving the panel's pre-filled default verbatim would freeze the name,
+/// so that case is treated as a revert instead).
+fn apply_agent_prompt(text: &str, t: &Tuning, cfg: &Config, agent: &AgentHandle, ui: &Ui) {
+    let effective = if text.trim().is_empty() || text == setup::default_prompt(&cfg.persona) {
+        ""
+    } else {
+        text
+    };
+    if let Err(e) = setup::save_agent_prompt(effective) {
+        ui.error(format!("写提示词文件失败: {e}"));
+        return;
+    }
+    // voice.json only governs kiro-cli; custom ACP backends manage their own
+    // persona. Reconnect kiro so the running agent loads the new identity.
+    if is_kiro(cfg) {
+        if let Err(e) = setup::write_agent_config(&t.agent_mode, &cfg.persona) {
+            ui.error(format!("写 voice.json 失败: {e}"));
+            return;
+        }
+        if let Some(kind) = agents::id_of(&cfg.agent_cmd).and_then(agents::find) {
+            let argv = launch_argv(kind, &t.agent_mode, &t.model);
+            agent.switch(argv.clone(), agent_env(&argv));
+            ui.notice("身份提示词已更新，agent 已重连");
+        }
+    } else {
+        ui.notice("身份提示词已保存（当前不是 kiro-cli 后端，下次连接时生效）");
     }
 }
 
@@ -851,7 +969,7 @@ fn usable_alternative(cfg: &Config) -> Option<(&'static agents::Kind, Vec<String
     agents::KINDS
         .iter()
         .find(|k| Some(k.id) != current && agents::state(k).usable())
-        .map(|k| (k, agents::argv(k, &cfg.agent_mode)))
+        .map(|k| (k, launch_argv(k, &cfg.agent_mode, &cfg.model)))
 }
 
 fn fallback_if_unusable(cfg: &Config, ui: &Ui) -> Vec<String> {
@@ -897,7 +1015,7 @@ fn switch_agent(id: &str, agent: &AgentHandle, ui: &Ui, cfg: &Config) {
         ui.error(format!("{} 现在不可用（{}）", kind.label, state.label()));
         return;
     }
-    let argv = agents::argv(kind, &cfg.agent_mode);
+    let argv = launch_argv(kind, &cfg.agent_mode, &cfg.model);
     ui.notice(format!("切换到 {}：{}", kind.label, argv.join(" ")));
     agent.switch(argv.clone(), agent_env(&argv));
     if let Some(mut s) = setup::load() {
@@ -998,10 +1116,11 @@ fn from_command(cmd: UiCommand) -> (Intent, String) {
         // Reached only if a caller forgets to intercept these; abandoning is the
         // conservative reading (do not leave a task running against an agent
         // that is being replaced, or through a settings change).
-        UiCommand::SwitchAgent(_) => (Intent::Abandon, String::new()),
+        UiCommand::SwitchAgent(_) | UiCommand::ApplyAgentPrompt(_) => (Intent::Abandon, String::new()),
         UiCommand::Tune(_)
         | UiCommand::InstallAdapter(_)
         | UiCommand::InstallCli(_)
+        | UiCommand::TtsPreview
         | UiCommand::Talk(_) => {
             (Intent::Abandon, String::new())
         }
@@ -1206,32 +1325,59 @@ fn session_test(cfg: &Config) -> Result<()> {
 struct Tuning {
     /// kiro-cli permission mode; also decides tool auto-approval.
     agent_mode: String,
+    /// Model the agent is launched with (empty = backend default).
+    model: String,
     /// True = hold a key to talk; false = always listening for the wake word.
     push_to_talk: bool,
     wake_threshold: f32,
     silence_ms: f32,
     no_speech_ms: f32,
     max_utterance_ms: f32,
+    /// Voice replies, as configured rather than as resolved: engine id, voice
+    /// name, words per minute, sidecar argv.
+    tts_id: String,
+    tts_voice: String,
+    tts_rate: u32,
+    tts_cmd: String,
+    /// ASR language, needed to re-resolve the engine (it picks a default voice
+    /// per language). Not tunable itself — changing it needs a model reload.
+    lang: String,
 }
 
 impl Tuning {
     fn from(cfg: &Config) -> Self {
         Tuning {
             agent_mode: cfg.agent_mode.clone(),
+            model: cfg.model.clone(),
             push_to_talk: cfg.push_to_talk,
             wake_threshold: cfg.wake_threshold,
             silence_ms: cfg.silence_ms,
             no_speech_ms: cfg.no_speech_ms,
             max_utterance_ms: cfg.max_utterance_ms,
+            tts_id: cfg.tts_id.clone(),
+            tts_voice: cfg.tts_voice.clone(),
+            tts_rate: cfg.tts_rate,
+            tts_cmd: cfg.tts_cmd.clone(),
+            lang: cfg.lang.clone(),
         }
+    }
+
+    /// The engine these settings add up to.
+    fn tts_engine(&self) -> tts::Engine {
+        tts::Engine::resolve(&self.tts_id, &self.tts_voice, self.tts_rate, &self.tts_cmd, &self.lang)
     }
 }
 
 /// Apply one live parameter change, clamped to a range that cannot brick the
 /// pipeline (a 0 threshold would fire constantly; a 0 silence would cut every
 /// word), then persist it so a restart keeps the choice.
-fn tune(t: &mut Tuning, change: ui::Tunable, ui: &Ui) {
+fn tune(t: &mut Tuning, change: ui::Tunable, ui: &Ui, speaker: &tts::Tts) -> bool {
     use ui::Tunable;
+    // Whether this change alters what the player should be using.
+    let mut tts_changed = false;
+    // Whether the agent has to be relaunched to take effect (the model is a launch
+    // flag, so there is no way to change it in place).
+    let mut model_changed = false;
     let what = match change {
         Tunable::WakeThreshold(v) => {
             t.wake_threshold = v.clamp(0.05, 0.95);
@@ -1257,7 +1403,56 @@ fn tune(t: &mut Tuning, change: ui::Tunable, ui: &Ui) {
                 "已切回常听模式（说唤醒词开始）".to_string()
             }
         }
+        Tunable::Model(id) => {
+            t.model = id;
+            model_changed = true;
+            if t.model.is_empty() {
+                "模型 = 后端默认".to_string()
+            } else {
+                format!("模型 = {}", t.model)
+            }
+        }
+        Tunable::TtsEngine(id) => {
+            t.tts_id = id;
+            tts_changed = true;
+            match t.tts_id.as_str() {
+                "off" => "语音回复已关闭".to_string(),
+                other => format!("语音回复引擎 = {other}"),
+            }
+        }
+        Tunable::TtsVoice(v) => {
+            t.tts_voice = v;
+            tts_changed = true;
+            if t.tts_voice.trim().is_empty() {
+                "音色 = 按语言自动选".to_string()
+            } else {
+                format!("音色 = {}", t.tts_voice)
+            }
+        }
+        Tunable::TtsRate(r) => {
+            // 0 means "engine default"; the rest is clamped to a range that stays
+            // intelligible (say accepts far more, to no good end).
+            t.tts_rate = if r == 0 { 0 } else { r.clamp(80, 400) };
+            tts_changed = true;
+            if t.tts_rate == 0 {
+                "语速 = 引擎默认".to_string()
+            } else {
+                format!("语速 = {} 字/分", t.tts_rate)
+            }
+        }
+        Tunable::TtsCmd(cmd) => {
+            t.tts_cmd = cmd;
+            tts_changed = true;
+            format!("语音 sidecar = {}", if t.tts_cmd.is_empty() { "（空）" } else { &t.tts_cmd })
+        }
     };
+    if tts_changed {
+        let engine = t.tts_engine();
+        // Stop first: the sentence being spoken belongs to the old settings, and
+        // hearing the change take effect immediately is the point of the panel.
+        speaker.stop();
+        speaker.set_engine(engine);
+    }
     ui.notice(what);
     if let Some(mut s) = setup::load() {
         s.threshold = t.wake_threshold;
@@ -1265,10 +1460,16 @@ fn tune(t: &mut Tuning, change: ui::Tunable, ui: &Ui) {
         s.no_speech_ms = t.no_speech_ms as u32;
         s.listen_mode = if t.push_to_talk { "ptt".into() } else { "wake".into() };
         s.agent_mode = t.agent_mode.clone();
+        s.model = t.model.clone();
+        s.tts = t.tts_id.clone();
+        s.tts_voice = t.tts_voice.clone();
+        s.tts_rate = t.tts_rate;
+        s.tts_cmd = t.tts_cmd.clone();
         if let Err(e) = setup::save(&s) {
             ui.error(format!("已生效，但写入配置失败: {e}"));
         }
     }
+    model_changed
 }
 
 /// Record for exactly as long as the talk key is held.
@@ -1277,31 +1478,70 @@ fn tune(t: &mut Tuning, change: ui::Tunable, ui: &Ui) {
 /// running the VAD would cut them off mid-pause. `max_utterance_ms` still applies
 /// as a runaway guard (a stuck key must not record forever). Audio keeps being
 /// consumed either way, because a full capture channel stalls the whole pipeline.
+/// Outcome of a push-to-talk recording.
+enum Held {
+    /// Long enough to be speech.
+    Audio(Vec<i16>),
+    /// A stray tap; the caller says so rather than bothering the agent.
+    TooShort,
+    /// The front end went away (window closed) while the key was down.
+    Quit,
+}
+
+/// Record while the talk key is held. The key *is* the endpointer — no VAD, so a
+/// pause mid-sentence does not cut the utterance short.
+///
+/// This reads the command channel itself, and that is the whole point. Until
+/// v0.22.1 it watched a shared `talk_held` flag which only the main loop could
+/// write, while the main loop sat blocked inside this function: the release event
+/// waited in the queue, unread, and recording ran until `max_utterance_ms`
+/// (59s on the reporting user's config). Anything else queued behind it was then
+/// replayed afterwards, including further key presses, which started more
+/// full-length recordings and made the whole thing look randomly broken.
+///
+/// Commands other than the release are **dropped**, not queued: a settings click
+/// made while talking should not take effect the moment the key comes up.
 fn record_while_held(
     rx: &Receiver<Vec<i16>>,
-    held: &Arc<AtomicBool>,
+    commands: &Receiver<UiCommand>,
     t: &Tuning,
-) -> Result<Option<Vec<i16>>> {
+) -> Result<Held> {
     let mut audio: Vec<i16> = Vec::new();
-    let mut total_ms = 0f32;
-    while held.load(Ordering::SeqCst) {
-        match rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(chunk) => {
-                total_ms += chunk.len() as f32 * 1000.0 / 16000.0;
-                audio.extend_from_slice(&chunk);
-            }
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => total_ms += 200.0,
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                anyhow::bail!("audio capture stopped (input device gone?)")
-            }
+    loop {
+        select! {
+            recv(rx) -> chunk => match chunk {
+                Ok(chunk) => audio.extend_from_slice(&chunk),
+                Err(_) => anyhow::bail!("audio capture stopped (input device gone?)"),
+            },
+            recv(commands) -> cmd => match cmd {
+                // Key up: this is the end of the utterance — but audio already
+                // captured may still be sitting in the queue. `select!` picks
+                // randomly between ready channels, so stopping here without
+                // draining would throw away the tail of what was just said (and
+                // leave stale samples for the next reader). Take what is there,
+                // then stop.
+                Ok(UiCommand::Talk(false)) => {
+                    audio.extend(rx.try_iter().flatten());
+                    break;
+                }
+                // Window closed: stop everything, do not transcribe.
+                Ok(UiCommand::Quit) | Err(_) => return Ok(Held::Quit),
+                // Everything else, including a repeated key-down, is noise here.
+                Ok(_) => {}
+            },
         }
-        if total_ms >= t.max_utterance_ms {
+        // Failsafe for a key that never comes up (focus lost mid-press, a stuck
+        // modifier): bounded by the same cap a wake-word utterance has.
+        if ms(&audio) >= t.max_utterance_ms {
             break;
         }
     }
-    // Too short to be speech: a stray tap should not reach the agent.
-    let ms = audio.len() as f32 * 1000.0 / 16000.0;
-    Ok(if ms >= 250.0 { Some(audio) } else { None })
+    Ok(if ms(&audio) >= 250.0 { Held::Audio(audio) } else { Held::TooShort })
+}
+
+/// Duration of 16 kHz mono samples, in milliseconds.
+fn ms(audio: &[i16]) -> f32 {
+    audio.len() as f32 * 1000.0 / 16000.0
 }
 
 /// Record until the speaker stops talking (VAD-based endpointing).
@@ -1599,6 +1839,97 @@ mod tests {
     #[test]
     fn a_reset_outranks_an_abandon() {
         assert_eq!(classify_intent("重新开始，之前的不用了"), Intent::NewSession);
+    }
+
+    /// A `Tuning` for tests. The cap matters: the bug these tests guard against
+    /// was "recording runs until `max_utterance_ms`".
+    fn test_tuning() -> Tuning {
+        Tuning {
+            agent_mode: "readonly".into(),
+            model: String::new(),
+            push_to_talk: true,
+            wake_threshold: 0.5,
+            silence_ms: 1000.0,
+            no_speech_ms: 6000.0,
+            max_utterance_ms: 30_000.0,
+            tts_id: "off".into(),
+            tts_voice: String::new(),
+            tts_rate: 0,
+            tts_cmd: String::new(),
+            lang: "zh".into(),
+        }
+    }
+
+    /// 400ms of (silent) 16 kHz mono audio — long enough to count as speech.
+    fn chunk(ms: usize) -> Vec<i16> {
+        vec![0i16; ms * 16]
+    }
+
+    /// The regression this whole rewrite exists for: releasing the key must end the
+    /// recording at once. It used to be watched through a shared flag that only the
+    /// main loop could write, while the main loop was blocked inside the recorder —
+    /// so the release sat unread and recording ran for the full 30–59s cap.
+    #[test]
+    fn releasing_the_key_ends_the_recording_at_once() {
+        let (atx, arx) = crossbeam_channel::bounded::<Vec<i16>>(8);
+        let (ctx, crx) = crossbeam_channel::unbounded::<UiCommand>();
+        atx.send(chunk(400)).unwrap();
+        ctx.send(UiCommand::Talk(false)).unwrap();
+
+        let start = std::time::Instant::now();
+        let out = record_while_held(&arx, &crx, &test_tuning()).unwrap();
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "must not wait for max_utterance_ms"
+        );
+        match out {
+            Held::Audio(audio) => assert!(ms(&audio) >= 400.0, "got {}ms", ms(&audio)),
+            _ => panic!("expected audio"),
+        }
+    }
+
+    /// Unrelated commands must not end the utterance, and must not be left in the
+    /// queue to be replayed afterwards either.
+    #[test]
+    fn other_commands_do_not_end_the_recording() {
+        let (atx, arx) = crossbeam_channel::bounded::<Vec<i16>>(8);
+        let (ctx, crx) = crossbeam_channel::unbounded::<UiCommand>();
+        atx.send(chunk(300)).unwrap();
+        ctx.send(UiCommand::Pause).unwrap();
+        ctx.send(UiCommand::Talk(true)).unwrap(); // a repeat, not an end
+        atx.send(chunk(300)).unwrap();
+        ctx.send(UiCommand::Talk(false)).unwrap();
+
+        match record_while_held(&arx, &crx, &test_tuning()).unwrap() {
+            Held::Audio(audio) => assert!(ms(&audio) >= 600.0, "got {}ms", ms(&audio)),
+            _ => panic!("expected audio"),
+        }
+        assert!(crx.is_empty(), "commands seen while talking must be dropped, not queued");
+    }
+
+    #[test]
+    fn a_stray_tap_is_not_sent_to_the_agent() {
+        let (atx, arx) = crossbeam_channel::bounded::<Vec<i16>>(8);
+        let (ctx, crx) = crossbeam_channel::unbounded::<UiCommand>();
+        atx.send(chunk(100)).unwrap(); // under the 250ms floor
+        ctx.send(UiCommand::Talk(false)).unwrap();
+        assert!(matches!(
+            record_while_held(&arx, &crx, &test_tuning()).unwrap(),
+            Held::TooShort
+        ));
+    }
+
+    /// Closing the window while the key is down must shut down, not transcribe.
+    #[test]
+    fn closing_the_front_end_while_talking_quits() {
+        let (atx, arx) = crossbeam_channel::bounded::<Vec<i16>>(8);
+        let (ctx, crx) = crossbeam_channel::unbounded::<UiCommand>();
+        atx.send(chunk(400)).unwrap();
+        drop(ctx); // window gone
+        assert!(matches!(
+            record_while_held(&arx, &crx, &test_tuning()).unwrap(),
+            Held::Quit
+        ));
     }
 
     #[test]

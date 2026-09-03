@@ -89,7 +89,11 @@ voice-assistant gui
 - 对话流：你说的话、流式生成的回答；思考过程和工具调用默认折叠，勾选后展开
 - 暂停 / 继续 / 放弃三个按钮，和说"暂停/继续/算了"完全等价
 - 输入框：不方便说话时直接打字
-- ⚙ 设置面板：切 agent、装缺失的 CLI/适配器、拖参数、换监听方式、填模型 API key。
+- ⚙ 设置面板：按功能分成六个页签 —— **Agent**（切后端 / 选模型 / 权限档）、**语音**
+  （引擎 / 音色 / 语速 / sidecar，带"试听"，改完即时生效）、**听**（常听或按住说话 / 断句参数）、
+  **身份**（提示词）、**凭据**（模型 API key）、**重启项**。模型列表来自后端自己
+  （`kiro-cli chat --list-models`，带倍率，★ 是默认）；换模型会重启 agent，但同一后端会
+  `session/load` 把会话接回来。`dsh` 没有 `--model`，面板会直说而不是给个假控件。
   每个 agent 前面有个手绘小标记（kiro 是幽灵、dsh 是鲸鱼、Claude 是放射线、Codex 是六边形）——
   不是厂商官方 logo：egui 自带字体没有这些 emoji 字形，而打包商标素材要引入图片解码器
 
@@ -181,6 +185,7 @@ agent 进程被 SIGKILL 掉时，会话锁会留在原地且永不过期，那�
 | `whisper` | `VA_WHISPER_MODEL`* | base | whisper 模型：base / small / medium |
 | `threshold` | `VA_WAKE_THRESHOLD` | 0.5 | 唤醒词检测阈值 |
 | `agent_mode` | — | readonly | kiro 权限：readonly / safe / full |
+| `model` | `VA_MODEL` | 空 | 启动时传给后端的模型 id（仅支持 `--model` 的后端，如 kiro-cli）；空 = 后端默认 |
 | `agent_cmd` | `VA_AGENT_CMD` | kiro-cli acp --agent voice | ACP agent 启动命令（换后端只改这里） |
 | `tts` | `VA_TTS` | 按平台 | 语音回复引擎：say（macOS）/ sapi（Windows）/ espeak（Linux）/ cmd / off |
 | `tts_voice` | `VA_TTS_VOICE` | 自动 | 音色，留空则按语言选（zh → Tingting / cmn） |
@@ -201,7 +206,9 @@ agent 进程被 SIGKILL 掉时，会话锁会留在原地且永不过期，那�
 
 ### 语音回复
 
-setup 第 5 步开关，默认使用**系统自带**引擎，零额外安装：
+setup 第 5 步开关，默认使用**系统自带**引擎，零额外安装。也可以在**窗口的设置面板**里改
+（引擎 / 音色 / 语速 / 自定义 sidecar 命令），音色列表来自本机实际安装的嗓音（`say -v '?'`），
+旁边有"试听"按钮走的是和真实回答完全相同的播放路径。改完立即生效、并写回配置文件，不用重启：
 
 | 平台 | 引擎 | 说明 |
 |------|------|------|

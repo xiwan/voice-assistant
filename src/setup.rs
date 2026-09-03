@@ -47,6 +47,9 @@ pub struct Settings {
     pub agent_cmd: String,
     /// kiro-cli agent permission mode: readonly / safe / full.
     pub agent_mode: String,
+    /// Model id passed to the agent at launch, for backends that take one
+    /// (`kiro-cli acp --model <id>`). Empty = the backend's own default.
+    pub model: String,
     /// End the utterance after this much trailing silence.
     pub silence_ms: u32,
     /// Give up (back to wake word) if no speech starts within this window.
@@ -77,6 +80,7 @@ impl Default for Settings {
             threshold: 0.5,
             agent_cmd: "kiro-cli acp --agent voice".into(),
             agent_mode: "readonly".into(),
+            model: String::new(),
             silence_ms: 1000,
             no_speech_ms: 6000,
             max_utterance_ms: 30000,
@@ -180,6 +184,41 @@ pub fn save_secret(name: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// The user's custom agent system prompt, if any.
+///
+/// Lives in its own file rather than `config` because the prompt is free-form
+/// multi-line text and `config` is one `key=value` per line. A missing or empty
+/// file means "use the default template" (`default_prompt`), so existing
+/// installs without this file behave exactly as before.
+fn agent_prompt_path() -> PathBuf {
+    base_dir().join("agent-prompt")
+}
+
+pub fn load_agent_prompt() -> Option<String> {
+    let text = fs::read_to_string(agent_prompt_path()).ok()?;
+    if text.trim().is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+/// Set or clear the custom agent prompt. An empty (or whitespace-only) value
+/// removes the file, reverting to the default template.
+pub fn save_agent_prompt(text: &str) -> Result<()> {
+    if text.trim().is_empty() {
+        match fs::remove_file(agent_prompt_path()) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        return Ok(());
+    }
+    fs::create_dir_all(base_dir())?;
+    fs::write(agent_prompt_path(), text)?;
+    Ok(())
+}
+
 /// Enough of a secret to recognise it, never enough to use it.
 pub fn mask(value: &str) -> String {
     let n = value.chars().count();
@@ -249,6 +288,7 @@ pub fn load() -> Option<Settings> {
             "threshold" => s.threshold = v.parse().unwrap_or(0.5),
             "agent_cmd" => s.agent_cmd = v.into(),
             "agent_mode" => s.agent_mode = v.into(),
+            "model" => s.model = v.into(),
             "silence_ms" => s.silence_ms = v.parse().unwrap_or(1000),
             "no_speech_ms" => s.no_speech_ms = v.parse().unwrap_or(6000),
             "max_utterance_ms" => s.max_utterance_ms = v.parse().unwrap_or(30000),
@@ -270,7 +310,7 @@ pub fn save(s: &Settings) -> Result<()> {
         config_path(),
         format!(
             "wake_word={}\nlang={}\nwhisper={}\nthreshold={}\nagent_cmd={}\n\
-             agent_mode={}\nsilence_ms={}\nno_speech_ms={}\nmax_utterance_ms={}\n\
+             agent_mode={}\nmodel={}\nsilence_ms={}\nno_speech_ms={}\nmax_utterance_ms={}\n\
              tts={}\ntts_voice={}\ntts_rate={}\ntts_cmd={}\n\
              listen_mode={}\nptt_key={}\n",
             s.wake_word,
@@ -279,6 +319,7 @@ pub fn save(s: &Settings) -> Result<()> {
             s.threshold,
             s.agent_cmd,
             s.agent_mode,
+            s.model,
             s.silence_ms,
             s.no_speech_ms,
             s.max_utterance_ms,
@@ -473,6 +514,9 @@ pub fn interactive_setup(existing: Option<Settings>) -> Result<Settings> {
         threshold,
         agent_cmd,
         agent_mode,
+        // Not asked here: the model is a panel choice, and setup must not silently
+        // reset one the user picked there.
+        model: cur.model.clone(),
         silence_ms,
         no_speech_ms,
         max_utterance_ms,
@@ -510,16 +554,42 @@ pub fn persona_name(wake_word: &str) -> String {
     }
 }
 
-/// Write the managed kiro-cli agent (~/.kiro/agents/voice.json) for the chosen
-/// permission mode, with the agent's identity bound to `persona` (the wake
-/// word). Overwrites previous content: this file is managed by voice-assistant.
-pub fn write_agent_config(mode: &str, persona: &str) -> Result<()> {
-    let prompt = format!(
+/// Default identity template, persona substituted in. A custom prompt saved in
+/// `~/.voice-assistant/agent-prompt` replaces this whole template; use the
+/// `{persona}` placeholder in a custom prompt to keep the name following the
+/// wake word (it is substituted here just like the default is generated).
+pub fn default_prompt(persona: &str) -> String {
+    format!(
         "你的名字是 {persona}，是用户的私人语音助手。有人问你是谁，就回答你是 {persona}。\
          用户的输入来自语音转文字，可能存在识别错误（同音字、专有名词错拼，如 kiro 被识别成 \
          Kerro/Q row、目录被识别成末路），请结合上下文推断真实意图后再回答。回答尽量简短、\
          口语化，适合朗读和快速浏览，避免长篇代码和表格。"
-    );
+    )
+}
+
+/// What actually lands in voice.json: the custom prompt when one is set (with
+/// `{persona}` substituted), otherwise the default template.
+fn effective_prompt(persona: &str) -> String {
+    match load_agent_prompt() {
+        Some(custom) => custom.replace("{persona}", persona),
+        None => default_prompt(persona),
+    }
+}
+
+/// JSON-escape a prompt so user text (quotes, backslashes, newlines) cannot
+/// break out of the `"prompt"` string and corrupt voice.json.
+fn json_escape(s: &str) -> String {
+    serde_json::to_string(s).expect("serialising a string cannot fail")
+}
+
+/// Write the managed kiro-cli agent (~/.kiro/agents/voice.json) for the chosen
+/// permission mode, with the agent's identity bound to `persona` (the wake
+/// word). Overwrites previous content: this file is managed by voice-assistant.
+/// A user prompt in `~/.voice-assistant/agent-prompt` (if any) wins over the
+/// default template, which is why every rewrite goes through this one function:
+/// a later startup / permission change / setup re-run must not erase it.
+pub fn write_agent_config(mode: &str, persona: &str) -> Result<()> {
+    let prompt = json_escape(&effective_prompt(persona));
     // Read-only shell commands auto-approved in "safe" mode (regex match).
     const SAFE_COMMANDS: &str = r#""pwd.*", "ls .*", "ls", "cat .*", "head .*", "tail .*", "grep .*", "find .*", "df.*", "du .*", "ps.*", "date.*", "whoami", "uname.*", "which .*", "echo .*", "git status.*", "git log.*", "git diff.*", "git branch.*""#;
     let body = match mode {
@@ -533,7 +603,7 @@ pub fn write_agent_config(mode: &str, persona: &str) -> Result<()> {
   "toolsSettings": {{
     "execute_bash": {{ "allowedCommands": [{SAFE_COMMANDS}] }}
   }},
-  "prompt": "{prompt}"
+  "prompt": {prompt}
 }}
 "#
         ),
@@ -544,7 +614,7 @@ pub fn write_agent_config(mode: &str, persona: &str) -> Result<()> {
   "mcpServers": {{}},
   "tools": ["fs_read", "fs_write", "execute_bash"],
   "allowedTools": ["fs_read", "fs_write", "execute_bash"],
-  "prompt": "{prompt}"
+  "prompt": {prompt}
 }}
 "#
         ),
@@ -555,7 +625,7 @@ pub fn write_agent_config(mode: &str, persona: &str) -> Result<()> {
   "mcpServers": {{}},
   "tools": ["fs_read"],
   "allowedTools": ["fs_read"],
-  "prompt": "{prompt}"
+  "prompt": {prompt}
 }}
 "#
         ),

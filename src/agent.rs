@@ -166,7 +166,7 @@ fn supervisor(
                 // not evidence that the switch happened, and a front end has no
                 // other way to know which agent it is now talking to.
                 ui.agent_ready(&cmd.join(" "));
-                match run_connection(&mut conn, &incoming, &cmd_rx, &state_tx, &store) {
+                match run_connection(&mut conn, &incoming, &cmd_rx, &state_tx, &store, &cmd) {
                     Exit::Shutdown => {
                         drop(conn); // graceful close + reap
                         return;
@@ -247,6 +247,10 @@ fn run_connection(
     cmd_rx: &Receiver<AgentCmd>,
     state_tx: &Sender<AgentState>,
     store: &Arc<Mutex<Store>>,
+    // argv of the agent currently connected, so a switch can tell whether the
+    // replacement is the same backend (and therefore whether waiting for a clean
+    // exit preserves anything).
+    current: &[String],
 ) -> Exit {
     loop {
         select! {
@@ -259,6 +263,11 @@ fn run_connection(
                     if conn.is_busy() {
                         let _ = conn.cancel_and_wait(incoming, CANCEL_GRACE);
                     }
+                    // Waiting for a clean exit only preserves a session the *same*
+                    // backend could load again. A different agent can never reuse
+                    // this session id, so the wait would only make the user watch
+                    // a spinner (measured: ~4s for kiro-cli).
+                    conn.set_graceful(next.as_slice() == current);
                     return Exit::Switch(next, env);
                 }
                 // Forget on purpose. Clearing before the reconnect is what makes

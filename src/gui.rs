@@ -18,6 +18,7 @@
 //!   GNOME/Wayland, as documented by SpeakoFlow); glow avoids that whole stack.
 
 use crate::agents;
+use crate::models;
 use crate::ui::{ToolState, Tunable, Ui, UiCommand, UiEvent};
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use eframe::egui;
@@ -159,9 +160,43 @@ enum Row {
     Thought(String),
     Tool(String),
     Notice(String),
+    /// A stage of an operation in flight (agent launch). Overwritten in place, so
+    /// a switch leaves one line rather than four.
+    Progress(String),
     Error(String),
     /// The assistant spoke unprompted (the sign-off).
     Spoken(String),
+}
+
+/// Settings are grouped, not stacked: the panel used to be eight headings in one
+/// scroll, where "how listening starts" sat between two unrelated things and the
+/// dangerous permission switch was easy to hit while looking for something else.
+/// One tab per decision the user is actually making.
+#[derive(Clone, Copy, PartialEq)]
+enum Tab {
+    /// Which agent, which model, how much it is trusted.
+    Agent,
+    /// Spoken replies.
+    Voice,
+    /// How listening starts, and the endpointing knobs that go with it.
+    Listen,
+    /// The agent's identity prompt.
+    Identity,
+    /// Model API keys.
+    Keys,
+    /// Things that only take effect after a restart.
+    Restart,
+}
+
+impl Tab {
+    const ALL: [(Tab, &'static str); 6] = [
+        (Tab::Agent, "Agent"),
+        (Tab::Voice, "语音"),
+        (Tab::Listen, "听"),
+        (Tab::Identity, "身份"),
+        (Tab::Keys, "凭据"),
+        (Tab::Restart, "重启项"),
+    ];
 }
 
 struct App {
@@ -184,16 +219,45 @@ struct App {
     tools: usize,
     /// Settings panel state.
     show_settings: bool,
+    settings_tab: Tab,
+    /// Models the current backend offers, probed when the panel opens (it shells
+    /// out). Empty means either "this backend has no choice" or "could not ask".
+    model_list: Vec<models::Model>,
+    /// Model id currently selected; empty = the backend's own default.
+    model: String,
     /// Registry id of the agent believed to be running.
     agent_id: String,
     agent_cmd: String,
+    /// Which agent a switch is waiting for, and which stage it is at. Without
+    /// these the panel showed nothing between the click and the connection —
+    /// several seconds of "did that work?".
+    switching_to: Option<String>,
+    agent_stage: Option<String>,
     /// Availability of each agent, refreshed when the panel opens rather than
     /// every frame (each check touches the filesystem).
     agent_states: Vec<(&'static agents::Kind, agents::State)>,
     silence_ms: f32,
     no_speech_ms: f32,
+    /// Voice replies, mirroring config: engine id, voice, words per minute (0 =
+    /// engine default), sidecar command for the "cmd" engine.
+    tts_id: String,
+    tts_voice: String,
+    tts_rate: u32,
+    tts_cmd: String,
+    /// ASR language, used only to sort the voice list so the relevant ones are
+    /// not buried under dozens of English voices.
+    lang: String,
+    /// Voices actually installed on this machine, probed when the panel opens
+    /// (name, locale). Empty on platforms with no way to ask.
+    voices: Vec<(String, String)>,
     /// kiro-cli permission mode: readonly / safe / full.
     agent_mode: String,
+    /// In-progress text of the agent system prompt (identity in voice.json).
+    /// Pre-filled from the custom prompt file, or the default template.
+    agent_prompt_edit: String,
+    /// Whether `agent_prompt_edit` started as the default template rather than
+    /// a saved custom prompt (drives the "已自定义/默认模板" caption).
+    agent_prompt_is_default: bool,
     /// Hold-to-talk instead of the wake word.
     push_to_talk: bool,
     /// The key held to talk, and whether we are waiting for the user to press a
@@ -233,6 +297,13 @@ impl App {
                 ctx.request_repaint();
             }
         });
+        // Prompt editor seeds from a saved custom prompt when one exists,
+        // otherwise from the default template (persona substituted) so the user
+        // can read what the agent currently gets before changing anything.
+        let (agent_prompt_edit, agent_prompt_is_default) = match crate::setup::load_agent_prompt() {
+            Some(custom) => (custom, false),
+            None => (crate::setup::default_prompt(&cfg.persona), true),
+        };
         let mut app = App {
             inbox,
             commands,
@@ -248,12 +319,25 @@ impl App {
             thoughts: 0,
             tools: 0,
             show_settings: false,
+            settings_tab: Tab::Agent,
+            model_list: Vec::new(),
+            model: cfg.model.clone(),
             agent_id: agents::id_of(&cfg.agent_cmd).unwrap_or("custom").to_string(),
+            switching_to: None,
+            agent_stage: None,
             agent_cmd: cfg.agent_cmd.join(" "),
             agent_states: Vec::new(),
             silence_ms: cfg.silence_ms,
             no_speech_ms: cfg.no_speech_ms,
+            tts_id: cfg.tts_id.clone(),
+            tts_voice: cfg.tts_voice.clone(),
+            tts_rate: cfg.tts_rate,
+            tts_cmd: cfg.tts_cmd.clone(),
+            lang: cfg.lang.clone(),
+            voices: Vec::new(),
             agent_mode: cfg.agent_mode.clone(),
+            agent_prompt_edit,
+            agent_prompt_is_default,
             push_to_talk: cfg.push_to_talk,
             ptt_key: egui::Key::from_name(&cfg.ptt_key).unwrap_or(egui::Key::Space),
             rebinding: false,
@@ -273,6 +357,23 @@ impl App {
     /// demand (opening the panel) instead of every frame.
     fn refresh_agents(&mut self) {
         self.agent_states = agents::KINDS.iter().map(|k| (k, agents::state(k))).collect();
+    }
+
+    /// Ask the system which voices exist, instead of making the user type a name
+    /// that may not be installed. Probed on demand (panel open), like the agent
+    /// states — it shells out, so not every frame.
+    ///
+    /// macOS only: `say -v '?'` is the one portable-enough enumeration available.
+    /// Elsewhere the list stays empty and the panel falls back to a text field,
+    /// which is honest about not knowing.
+    fn refresh_voices(&mut self) {
+        self.voices = list_voices();
+    }
+
+    /// Ask the running backend what models it offers. Same rule as the voice list:
+    /// on demand, never per frame.
+    fn refresh_models(&mut self) {
+        self.model_list = models::list(&self.agent_id);
     }
 
     /// Watch the talk key and report only its *edges*, so the pipeline gets one
@@ -301,6 +402,9 @@ impl App {
             return;
         }
         if !self.push_to_talk {
+            // Leaving push-to-talk while the key is down would otherwise leave
+            // `talk_down` stuck true, and the next press would look like no change.
+            self.talk_down = false;
             return;
         }
         let typing = ctx.egui_wants_keyboard_input();
@@ -353,8 +457,14 @@ impl App {
                 if self.phase == Phase::Restarting {
                     self.phase = Phase::Idle; // connected, so stop saying 重启中
                 }
+                // The switch is over, whichever way it went.
+                self.switching_to = None;
+                self.agent_stage = None;
                 if self.show_settings {
                     self.refresh_agents();
+                    // Models are backend-specific: the list that was on screen
+                    // belonged to the previous agent.
+                    self.refresh_models();
                 }
             }
             UiEvent::WakeScore(s) => self.wake_score = s,
@@ -418,7 +528,20 @@ impl App {
             }
             UiEvent::AgentRestarting(why) => {
                 self.phase = Phase::Restarting;
-                self.rows.push(Row::Error(format!("agent 重启中: {why}")));
+                // A deliberate switch is not a fault, and neither is a reconnect
+                // the supervisor handles by itself; showing both in error red made
+                // normal operation look broken.
+                self.rows.push(Row::Notice(format!("agent 重启中: {why}")));
+            }
+            // Progress during a launch: replaces the previous progress line rather
+            // than stacking four of them per switch.
+            UiEvent::AgentProgress(what) => {
+                self.phase = Phase::Restarting;
+                self.agent_stage = Some(what.clone());
+                match self.rows.last_mut() {
+                    Some(Row::Progress(last)) => *last = what,
+                    _ => self.rows.push(Row::Progress(what)),
+                }
             }
             // Continuity is only worth a line when there was something to lose:
             // a first run says nothing, a recovery says what it cost.
@@ -490,6 +613,8 @@ impl App {
                     self.show_settings = !self.show_settings;
                     if self.show_settings {
                         self.refresh_agents();
+                        self.refresh_voices();
+                        self.refresh_models();
                     }
                 }
                 ui.checkbox(&mut self.show_details, "显示思考/工具");
@@ -534,6 +659,13 @@ impl App {
                         Row::Error(text) => {
                             ui.colored_label(egui::Color32::from_rgb(230, 110, 100), format!("! {text}"));
                         }
+                        // Amber like the "restarting" light: something is under way.
+                        Row::Progress(text) => {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(230, 170, 60),
+                                format!("… {text}"),
+                            );
+                        }
                         Row::Thought(text) if self.show_details => {
                             ui.weak(format!("思考: {text}"));
                         }
@@ -560,7 +692,32 @@ impl App {
     /// Settings. Split in two on purpose: what can change now, and what is
     /// written to the config file but only takes effect after a restart. Showing
     /// a control that silently does nothing is worse than not showing it.
+    /// One tab per decision, instead of eight headings in one scroll.
     fn settings(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            for (tab, label) in Tab::ALL {
+                if ui
+                    .selectable_label(self.settings_tab == tab, label)
+                    .clicked()
+                {
+                    self.settings_tab = tab;
+                }
+            }
+        });
+        ui.separator();
+        match self.settings_tab {
+            Tab::Agent => self.tab_agent(ui),
+            Tab::Voice => self.tab_voice(ui),
+            Tab::Listen => self.tab_listen(ui),
+            Tab::Identity => self.tab_identity(ui),
+            Tab::Keys => self.tab_keys(ui),
+            Tab::Restart => self.tab_restart(ui),
+        }
+    }
+
+    /// Which agent, which model, how much it is trusted — one decision in three
+    /// parts, which is why they now sit together instead of at opposite ends.
+    fn tab_agent(&mut self, ui: &mut egui::Ui) {
         ui.heading("Agent");
         ui.weak(format!("当前: {}", self.agent_cmd));
         ui.add_space(4.0);
@@ -585,6 +742,14 @@ impl App {
                     ui.colored_label(color, "●");
                 } else {
                     ui.label(kind.label);
+                }
+                // The click has to be visible: a launch takes seconds, and until
+                // this the row looked exactly as it did before the click.
+                if self.switching_to.as_deref() == Some(kind.id) {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(230, 170, 60),
+                        self.agent_stage.as_deref().unwrap_or("切换中…"),
+                    );
                 }
                 ui.weak(state.label());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -635,6 +800,7 @@ impl App {
             let label = agents::find(id).map(|k| k.label).unwrap_or(id);
             self.rows.push(Row::Notice(format!("正在切换到 {label}…")));
             self.phase = Phase::Restarting;
+            self.switching_to = Some(id.to_string());
             self.send(UiCommand::SwitchAgent(id.to_string()));
         }
         if let Some(id) = install {
@@ -645,27 +811,221 @@ impl App {
         }
 
         ui.add_space(10.0);
-        ui.heading("即时生效");
-        if ui
-            .add(egui::Slider::new(&mut self.threshold, 0.05..=0.95).text("唤醒阈值"))
-            .drag_stopped()
-        {
-            self.send(UiCommand::Tune(Tunable::WakeThreshold(self.threshold)));
-        }
-        if ui
-            .add(egui::Slider::new(&mut self.silence_ms, 200.0..=3000.0).text("停顿判定 ms"))
-            .drag_stopped()
-        {
-            self.send(UiCommand::Tune(Tunable::SilenceMs(self.silence_ms)));
-        }
-        if ui
-            .add(egui::Slider::new(&mut self.no_speech_ms, 3000.0..=180_000.0).text("等待开口 ms"))
-            .drag_stopped()
-        {
-            self.send(UiCommand::Tune(Tunable::NoSpeechMs(self.no_speech_ms)));
-        }
 
         ui.add_space(10.0);
+        self.model_picker(ui);
+
+        ui.add_space(10.0);
+        ui.heading("权限（kiro-cli）");
+        // Ordered least to most dangerous, so the risky one is not the first thing
+        // a stray click lands on.
+        let mut mode = self.agent_mode.clone();
+        ui.horizontal(|ui| {
+            for (id, label) in [
+                ("readonly", "只读"),
+                ("safe", "安全命令"),
+                ("full", "完全信任"),
+            ] {
+                if ui.radio_value(&mut mode, id.to_string(), label).clicked() {
+                    self.agent_mode = mode.clone();
+                    self.send(UiCommand::Tune(Tunable::AgentMode(mode.clone())));
+                }
+            }
+        });
+        match self.agent_mode.as_str() {
+            "readonly" => ui.weak("只能读文件，最安全"),
+            "safe" => ui.weak("额外放行只读命令白名单（pwd / ls / cat / git status 等）"),
+            _ => ui.colored_label(
+                egui::Color32::from_rgb(230, 110, 100),
+                "任意命令 + 写文件。语音可能听错，慎用",
+            ),
+        };
+        ui.weak("改档立即生效：下一次工具调用就按新档判定，agent 会重连一次。");
+
+        ui.add_space(10.0);
+    }
+
+    /// Model choice for backends that take one at launch.
+    fn model_picker(&mut self, ui: &mut egui::Ui) {
+        ui.heading("模型");
+        if !models::selectable(&self.agent_id) {
+            ui.weak(models::unsupported_note(&self.agent_id));
+            return;
+        }
+        if self.model_list.is_empty() {
+            ui.weak("拿不到模型列表（CLI 没响应或未登录）");
+            if ui.button("重试").clicked() {
+                self.refresh_models();
+            }
+            return;
+        }
+        let current = if self.model.is_empty() {
+            "后端默认".to_string()
+        } else {
+            self.model.clone()
+        };
+        let mut picked: Option<String> = None;
+        egui::ComboBox::from_id_salt("model")
+            .selected_text(current)
+            .width(260.0)
+            .show_ui(ui, |ui| {
+                if ui.selectable_label(self.model.is_empty(), "后端默认").clicked() {
+                    picked = Some(String::new());
+                }
+                for m in &self.model_list {
+                    let mark = if m.default { " ★" } else { "" };
+                    let label = if m.cost.is_empty() {
+                        format!("{}{mark}", m.id)
+                    } else {
+                        format!("{}{mark}   {}", m.id, m.cost)
+                    };
+                    if ui
+                        .selectable_label(self.model == m.id, label)
+                        .on_hover_text(&m.note)
+                        .clicked()
+                    {
+                        picked = Some(m.id.clone());
+                    }
+                }
+            });
+        if let Some(id) = picked {
+            self.model = id.clone();
+            // A model is a launch flag, so this relaunches the agent. Same backend,
+            // so the session is reloaded and the conversation carries over.
+            self.phase = Phase::Restarting;
+            self.send(UiCommand::Tune(Tunable::Model(id)));
+        }
+        ui.weak("改模型会重启 agent（同一后端，会话会接回来）。★ 是后端默认。");
+    }
+
+    /// Spoken replies.
+    fn tab_voice(&mut self, ui: &mut egui::Ui) {
+        ui.heading("语音回复");
+        // Engine first: a voice, a rate and a sidecar all mean nothing until an
+        // engine is chosen, and "off" is a legitimate choice rather than a
+        // failure state.
+        let mut id = self.tts_id.clone();
+        ui.horizontal(|ui| {
+            let mut engines: Vec<(&str, &str)> = vec![("off", "关闭")];
+            if cfg!(target_os = "macos") {
+                engines.push(("say", "系统 say"));
+            }
+            if cfg!(target_os = "windows") {
+                engines.push(("sapi", "系统 SAPI"));
+            }
+            if cfg!(target_os = "linux") {
+                engines.push(("espeak", "espeak-ng"));
+            }
+            engines.push(("cmd", "自定义命令"));
+            for (value, label) in engines {
+                if ui.radio_value(&mut id, value.to_string(), label).clicked() {
+                    self.tts_id = id.clone();
+                    self.send(UiCommand::Tune(Tunable::TtsEngine(id.clone())));
+                }
+            }
+        });
+
+        if self.tts_id != "off" {
+            // Voice. The list is what is installed; "自动" defers to the language
+            // default (zh -> Tingting) rather than pinning a name that may not
+            // exist on another machine.
+            if self.tts_id == "say" && !self.voices.is_empty() {
+                let current = if self.tts_voice.trim().is_empty() {
+                    "自动（按语言）".to_string()
+                } else {
+                    self.tts_voice.clone()
+                };
+                let mut picked: Option<String> = None;
+                ui.horizontal(|ui| {
+                    ui.weak("音色");
+                    egui::ComboBox::from_id_salt("tts_voice")
+                        .selected_text(current)
+                        .show_ui(ui, |ui| {
+                            if ui.selectable_label(self.tts_voice.is_empty(), "自动（按语言）").clicked() {
+                                picked = Some(String::new());
+                            }
+                            // Voices for the ASR language first: on a zh setup the
+                            // dozens of English voices are noise.
+                            let lang = if self.lang.starts_with("zh") { "zh" } else { &self.lang };
+                            let (mine, others): (Vec<_>, Vec<_>) = self
+                                .voices
+                                .iter()
+                                .partition(|(_, loc)| loc.to_lowercase().starts_with(lang));
+                            for (name, loc) in mine.iter().chain(others.iter()) {
+                                let selected = &self.tts_voice == name;
+                                if ui
+                                    .selectable_label(selected, format!("{name}  ({loc})"))
+                                    .clicked()
+                                {
+                                    picked = Some(name.clone());
+                                }
+                            }
+                        });
+                });
+                if let Some(v) = picked {
+                    self.tts_voice = v.clone();
+                    self.send(UiCommand::Tune(Tunable::TtsVoice(v)));
+                }
+            } else if self.tts_id != "cmd" {
+                // No enumeration available (or not the say engine): a plain field,
+                // applied on Enter or focus loss.
+                ui.horizontal(|ui| {
+                    ui.weak("音色");
+                    let r = ui.text_edit_singleline(&mut self.tts_voice);
+                    if r.lost_focus() || r.changed() && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                    {
+                        self.send(UiCommand::Tune(Tunable::TtsVoice(self.tts_voice.clone())));
+                    }
+                });
+            }
+
+            // Rate. 0 is "engine default", which is a different thing from any
+            // number, so it gets a checkbox rather than a magic slider position.
+            let mut engine_default = self.tts_rate == 0;
+            if ui.checkbox(&mut engine_default, "语速用引擎默认").clicked() {
+                self.tts_rate = if engine_default { 0 } else { 200 };
+                self.send(UiCommand::Tune(Tunable::TtsRate(self.tts_rate)));
+            }
+            if !engine_default {
+                let mut rate = self.tts_rate.max(80) as f32;
+                if ui
+                    .add(egui::Slider::new(&mut rate, 80.0..=400.0).text("语速 字/分"))
+                    .drag_stopped()
+                {
+                    self.tts_rate = rate as u32;
+                    self.send(UiCommand::Tune(Tunable::TtsRate(self.tts_rate)));
+                }
+            }
+
+            if self.tts_id == "cmd" {
+                ui.weak("sidecar 约定：从 stdin 读一句、自己合成并播放、放完退出（这样“停”能打断）");
+                ui.horizontal(|ui| {
+                    let r = ui.add_sized(
+                        [ui.available_width() - 4.0, 24.0],
+                        egui::TextEdit::singleline(&mut self.tts_cmd)
+                            .hint_text("python3 /abs/path/scripts/kokoro_say.py"),
+                    );
+                    if r.lost_focus() {
+                        self.send(UiCommand::Tune(Tunable::TtsCmd(self.tts_cmd.clone())));
+                    }
+                });
+            }
+
+            if ui
+                .button("🔊 试听")
+                .on_hover_text("用当前设置念一句，走的是和回答完全相同的播放路径")
+                .clicked()
+            {
+                self.send(UiCommand::TtsPreview);
+            }
+        }
+        ui.weak("这一段改完立即生效，并写回配置文件。");
+
+        ui.add_space(10.0);
+    }
+
+    /// How listening starts, together with the timings that shape an utterance.
+    fn tab_listen(&mut self, ui: &mut egui::Ui) {
         ui.heading("怎么开始听");
         // Mode first, key second: the key is meaningless in wake-word mode.
         let mut mode = self.push_to_talk;
@@ -699,33 +1059,72 @@ impl App {
         }
 
         ui.add_space(10.0);
-        ui.heading("权限（kiro-cli）");
-        // Ordered least to most dangerous, so the risky one is not the first thing
-        // a stray click lands on.
-        let mut mode = self.agent_mode.clone();
-        ui.horizontal(|ui| {
-            for (id, label) in [
-                ("readonly", "只读"),
-                ("safe", "安全命令"),
-                ("full", "完全信任"),
-            ] {
-                if ui.radio_value(&mut mode, id.to_string(), label).clicked() {
-                    self.agent_mode = mode.clone();
-                    self.send(UiCommand::Tune(Tunable::AgentMode(mode.clone())));
-                }
-            }
-        });
-        match self.agent_mode.as_str() {
-            "readonly" => ui.weak("只能读文件，最安全"),
-            "safe" => ui.weak("额外放行只读命令白名单（pwd / ls / cat / git status 等）"),
-            _ => ui.colored_label(
-                egui::Color32::from_rgb(230, 110, 100),
-                "任意命令 + 写文件。语音可能听错，慎用",
-            ),
-        };
-        ui.weak("改档立即生效：下一次工具调用就按新档判定，agent 会重连一次。");
 
         ui.add_space(10.0);
+        ui.heading("即时生效");
+        if ui
+            .add(egui::Slider::new(&mut self.threshold, 0.05..=0.95).text("唤醒阈值"))
+            .drag_stopped()
+        {
+            self.send(UiCommand::Tune(Tunable::WakeThreshold(self.threshold)));
+        }
+        if ui
+            .add(egui::Slider::new(&mut self.silence_ms, 200.0..=3000.0).text("停顿判定 ms"))
+            .drag_stopped()
+        {
+            self.send(UiCommand::Tune(Tunable::SilenceMs(self.silence_ms)));
+        }
+        if ui
+            .add(egui::Slider::new(&mut self.no_speech_ms, 3000.0..=180_000.0).text("等待开口 ms"))
+            .drag_stopped()
+        {
+            self.send(UiCommand::Tune(Tunable::NoSpeechMs(self.no_speech_ms)));
+        }
+
+        ui.add_space(10.0);
+    }
+
+    fn tab_identity(&mut self, ui: &mut egui::Ui) {
+        ui.heading("身份提示词");
+        // The custom prompt lives in ~/.voice-assistant/agent-prompt and is what
+        // the agent gets as its identity (voice.json's "prompt"). Editing it here
+        // goes through the pipeline so voice.json is rewritten and kiro reconnects.
+        if self.agent_prompt_is_default {
+            ui.weak("默认模板（名字随唤醒词）。改动并保存后成为自定义提示词。");
+        } else {
+            ui.weak("已自定义。想回到默认模板请点「恢复默认」。");
+        }
+        let mut apply: Option<String> = None;
+        ui.add(
+            egui::TextEdit::multiline(&mut self.agent_prompt_edit)
+                .desired_rows(6)
+                .desired_width(f32::INFINITY)
+                .hint_text("在这段话里写 {persona} 可让名字继续随唤醒词变化…"),
+        );
+        ui.horizontal(|ui| {
+            if ui.button("保存并生效").clicked() {
+                apply = Some(self.agent_prompt_edit.clone());
+            }
+            if ui.button("恢复默认").clicked() {
+                self.agent_prompt_edit = crate::setup::default_prompt(&self.persona);
+                apply = Some(self.agent_prompt_edit.clone());
+                self.agent_prompt_is_default = true;
+            }
+        });
+        ui.weak("保存后 agent 会重连一次，下一轮对话按新提示词进行。");
+        if let Some(text) = apply {
+            // Mirrors the pipeline's decision: an empty edit or one identical to
+            // the default template means "no custom prompt" (revert).
+            let is_default = text.trim().is_empty()
+                || text == crate::setup::default_prompt(&self.persona);
+            self.agent_prompt_is_default = is_default;
+            self.send(UiCommand::ApplyAgentPrompt(text));
+        }
+
+        ui.add_space(10.0);
+    }
+
+    fn tab_keys(&mut self, ui: &mut egui::Ui) {
         ui.heading("模型凭据");
         // Only agents that read a key from the environment appear here; the rest
         // authenticate through their own CLI login and there is nothing to hold.
@@ -780,6 +1179,9 @@ impl App {
         }
 
         ui.add_space(10.0);
+    }
+
+    fn tab_restart(&mut self, ui: &mut egui::Ui) {
         ui.heading("需重启生效");
         ui.weak("唤醒词 / 识别语言 / whisper 模型 / 语音引擎 —— 这些要重新加载模型，");
         ui.weak("目前仍在 `voice-assistant setup` 里改，改完重启进程。");
@@ -835,6 +1237,31 @@ impl App {
 /// MIT-licensed repo is a licence question this project should not take on.
 /// egui's bundled fonts were checked first — they have no ghost, whale, hexagon
 /// or even ●, so an emoji would have rendered as tofu.
+/// Installed voices as (name, locale), newest-macOS format:
+/// `Tingting            zh_CN    # 你好！我叫婷婷。`
+///
+/// The name can contain spaces ("Eddy (Chinese (China mainland))"), so the split
+/// is on the run of spaces before the locale rather than on the first space.
+fn list_voices() -> Vec<(String, String)> {
+    if !cfg!(target_os = "macos") {
+        return Vec::new();
+    }
+    let Ok(out) = std::process::Command::new("say").arg("-v").arg("?").output() else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| {
+            let head = line.split('#').next()?.trim_end();
+            let (name, locale) = head.rsplit_once("  ")?;
+            let locale = locale.trim();
+            let name = name.trim();
+            (!name.is_empty() && !locale.is_empty())
+                .then(|| (name.to_string(), locale.to_string()))
+        })
+        .collect()
+}
+
 fn agent_icon(ui: &mut egui::Ui, id: &str, color: egui::Color32) {
     let size = ui.text_style_height(&egui::TextStyle::Body);
     let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());

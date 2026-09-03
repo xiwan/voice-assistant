@@ -83,6 +83,11 @@ pub enum UiEvent {
     TurnEnd { reason: String },
     /// The supervisor is replacing a dead or wedged agent.
     AgentRestarting(String),
+    /// A stage of bringing an agent up (launch / handshake / session restore).
+    /// Separate from `AgentRestarting` because it is not a fault: a handshake takes
+    /// seconds (measured 4.3s for kiro-cli), and without this the window shows
+    /// nothing at all between the click and the connection.
+    AgentProgress(String),
     /// How much of the conversation survived opening a connection. Emitted on
     /// every connect, including the first (`Fresh`), so a front end never has to
     /// guess whether the assistant still remembers what was said.
@@ -124,11 +129,19 @@ pub enum UiCommand {
     /// Anything requiring a model reload (wake word, whisper size, language) is
     /// deliberately not here — those are written to config and need a restart.
     Tune(Tunable),
+    /// Replace the agent's system prompt (the identity in voice.json). The
+    /// pipeline persists it, rewrites the managed agent file, and reconnects
+    /// so the running agent picks it up — same path as a permission change.
+    ApplyAgentPrompt(String),
     /// Install an agent's ACP adapter (`npm install -g …`). Separate from
     /// switching because it runs third-party code and takes a while.
     InstallAdapter(String),
     /// Install the agent's own CLI, for the npm-distributed ones.
     InstallCli(String),
+    /// Speak a sample line with the current voice settings. An action, not a
+    /// `Tunable`: it changes nothing, it is how a voice gets judged without
+    /// waiting for the agent to say something.
+    TtsPreview,
     /// Push-to-talk key state: `true` on press, `false` on release. Ignored in
     /// wake-word mode.
     Talk(bool),
@@ -152,6 +165,19 @@ pub enum Tunable {
     /// call immediately; the agent is relaunched because the flag is on its
     /// command line and its allow-list file has to be rewritten.
     AgentMode(String),
+    /// Model the agent runs, for backends that take one at launch. Applied by
+    /// relaunching that same backend, so the session is reloaded and the
+    /// conversation continues across the change.
+    Model(String),
+    /// Spoken replies: engine id ("off" / "say" / "cmd" / "sapi" / "espeak").
+    /// Applied by swapping the player's engine, so it needs no restart.
+    TtsEngine(String),
+    /// Voice name for the current engine; empty = pick by language.
+    TtsVoice(String),
+    /// Speech rate in words per minute; 0 = engine default.
+    TtsRate(u32),
+    /// Sidecar command line used when the engine is "cmd".
+    TtsCmd(String),
 }
 
 /// Handle the pipeline holds. Cloneable and `Send`, because the ACP supervisor
@@ -227,6 +253,9 @@ impl Ui {
     }
     pub fn restarting(&self, why: &str) {
         self.emit(UiEvent::AgentRestarting(why.to_string()));
+    }
+    pub fn progress<S: Into<String>>(&self, what: S) {
+        self.emit(UiEvent::AgentProgress(what.into()));
     }
     pub fn context(&self, how: crate::session::Recovery) {
         self.emit(UiEvent::Context(how));
@@ -328,6 +357,7 @@ impl Term {
             }
             // Diagnostics keep going to stderr, as before.
             UiEvent::AgentRestarting(why) => eprintln!(">> agent 重启中: {why}"),
+            UiEvent::AgentProgress(what) => eprintln!(">> {what}"),
             UiEvent::Error(msg) => eprintln!(">> {msg}"),
         }
     }
