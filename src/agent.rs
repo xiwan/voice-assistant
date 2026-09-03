@@ -22,11 +22,12 @@
 //!      respawned with a fresh session.
 
 use crate::acp::{AcpConnection, Incoming};
+use crate::session::{Recovery, Store};
 use crate::tts::Tts;
 use crate::ui::Ui;
 use crossbeam_channel::{select, unbounded, Receiver, RecvTimeoutError, Sender};
 use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -39,6 +40,9 @@ pub enum AgentCmd {
     /// crashes, so switching backends is that same path with a new argv — the
     /// "exactly one agent" invariant is unchanged.
     Switch(Vec<String>, Vec<(String, String)>),
+    /// Deliberately abandon the conversation and start a clean session. Every
+    /// other path tries to preserve context, so forgetting has to be asked for.
+    NewSession,
     Shutdown,
 }
 
@@ -50,6 +54,10 @@ pub enum AgentState {
     Busy,
     Idle(String), // stopReason: end_turn / cancelled / ...
     Restarting(String),
+    /// How much of the conversation survived opening this connection. The main
+    /// loop needs it because a lost context invalidates a paused task that it,
+    /// not the supervisor, is holding.
+    Context(Recovery),
     /// Repeated launch failures: retrying is not going to help, so the supervisor
     /// stops and waits for a `Switch`. The owner decides what to do about it —
     /// it, not this module, knows which other agents exist.
@@ -78,10 +86,13 @@ impl AgentHandle {
         tts: Tts,
         ui: Ui,
         env: Vec<(String, String)>,
+        store: Arc<Mutex<Store>>,
     ) -> Self {
         let (cmd_tx, cmd_rx) = unbounded::<AgentCmd>();
         let (state_tx, state_rx) = unbounded::<AgentState>();
-        thread::spawn(move || supervisor(cmd, auto_approve, tts, ui, env, cmd_rx, state_tx));
+        thread::spawn(move || {
+            supervisor(cmd, auto_approve, tts, ui, env, store, cmd_rx, state_tx)
+        });
         AgentHandle { cmd_tx, state_rx }
     }
 
@@ -90,6 +101,10 @@ impl AgentHandle {
     }
     pub fn cancel(&self) {
         let _ = self.cmd_tx.send(AgentCmd::Cancel);
+    }
+    /// Forget the conversation and reconnect with a clean session.
+    pub fn new_session(&self) {
+        let _ = self.cmd_tx.send(AgentCmd::NewSession);
     }
     /// Swap in a different agent. Takes effect on the next connection, which the
     /// supervisor opens immediately.
@@ -104,10 +119,13 @@ impl AgentHandle {
 }
 
 /// Outcome of running one connection: reconnect (agent died / wedged), replace
-/// it with a different agent, or stop.
+/// it with a different agent, start over with an empty session, or stop.
 enum Exit {
     Reconnect,
     Switch(Vec<String>, Vec<(String, String)>),
+    /// The user asked to forget: reconnect immediately, with the store already
+    /// cleared so the new connection has nothing to continue.
+    Fresh,
     Shutdown,
 }
 
@@ -117,6 +135,7 @@ fn supervisor(
     tts: Tts,
     ui: Ui,
     env: Vec<(String, String)>,
+    store: Arc<Mutex<Store>>,
     cmd_rx: Receiver<AgentCmd>,
     state_tx: Sender<AgentState>,
 ) {
@@ -127,24 +146,35 @@ fn supervisor(
     const MAX_LAUNCH_FAILS: u32 = 3;
     let mut fails = 0u32;
     loop {
-        match AcpConnection::connect(&cmd, auto_approve.clone(), tts.clone(), ui.clone(), &env) {
-            Ok((mut conn, incoming)) => {
+        match AcpConnection::connect(
+            &cmd,
+            auto_approve.clone(),
+            tts.clone(),
+            ui.clone(),
+            &env,
+            store.clone(),
+        ) {
+            Ok((mut conn, incoming, recovered)) => {
                 backoff = BACKOFF_START; // healthy connection resets backoff
                 fails = 0;
                 let _ = state_tx.send(AgentState::Ready);
+                // How much of the conversation came back. Reported before
+                // `agent_ready` so a front end can show it next to the agent it
+                // now belongs to.
+                let _ = state_tx.send(AgentState::Context(recovered));
                 // Report the argv that actually connected: a switch request is
                 // not evidence that the switch happened, and a front end has no
                 // other way to know which agent it is now talking to.
                 ui.agent_ready(&cmd.join(" "));
-                match run_connection(&mut conn, &incoming, &cmd_rx, &state_tx) {
+                match run_connection(&mut conn, &incoming, &cmd_rx, &state_tx, &store) {
                     Exit::Shutdown => {
-                        drop(conn); // kill + reap
+                        drop(conn); // graceful close + reap
                         return;
                     }
                     // A switch is a deliberate replacement, so it skips the
                     // backoff a crash would earn and connects straight away.
                     Exit::Switch(next, next_env) => {
-                        drop(conn); // kill + reap before replacing (invariant)
+                        drop(conn); // close + reap before replacing (invariant)
                         cmd = next;
                         env = next_env;
                         let _ = state_tx.send(AgentState::Restarting(format!(
@@ -153,10 +183,15 @@ fn supervisor(
                         )));
                         backoff = BACKOFF_START;
                     }
+                    Exit::Fresh => {
+                        drop(conn);
+                        let _ = state_tx.send(AgentState::Restarting("开新会话".into()));
+                        backoff = BACKOFF_START;
+                    }
                     Exit::Reconnect => {
                         drop(conn); // kill + reap before replacing (invariant)
                         let _ = state_tx.send(AgentState::Restarting("agent 连接断开，重连中".into()));
-                        match wait_or_shutdown(&cmd_rx, backoff) {
+                        match wait_or_shutdown(&cmd_rx, backoff, &store) {
                             Downtime::Shutdown => return,
                             Downtime::Switch(next, next_env) => {
                                 cmd = next;
@@ -175,7 +210,7 @@ fn supervisor(
                     // command channel so a switch still gets through.
                     let _ = state_tx.send(AgentState::Failed(format!("{e}")));
                     loop {
-                        match wait_or_shutdown(&cmd_rx, Duration::from_secs(3600)) {
+                        match wait_or_shutdown(&cmd_rx, Duration::from_secs(3600), &store) {
                             Downtime::Shutdown => return,
                             Downtime::Switch(next, next_env) => {
                                 cmd = next;
@@ -190,7 +225,7 @@ fn supervisor(
                     continue;
                 }
                 let _ = state_tx.send(AgentState::Restarting(format!("启动失败: {e}")));
-                match wait_or_shutdown(&cmd_rx, backoff) {
+                match wait_or_shutdown(&cmd_rx, backoff, &store) {
                     Downtime::Shutdown => return,
                     Downtime::Switch(next, next_env) => {
                         cmd = next;
@@ -211,6 +246,7 @@ fn run_connection(
     incoming: &Receiver<Incoming>,
     cmd_rx: &Receiver<AgentCmd>,
     state_tx: &Sender<AgentState>,
+    store: &Arc<Mutex<Store>>,
 ) -> Exit {
     loop {
         select! {
@@ -224,6 +260,19 @@ fn run_connection(
                         let _ = conn.cancel_and_wait(incoming, CANCEL_GRACE);
                     }
                     return Exit::Switch(next, env);
+                }
+                // Forget on purpose. Clearing before the reconnect is what makes
+                // it stick: the new connection asks the store how to continue,
+                // and the answer has to be "there is nothing to continue".
+                Ok(AgentCmd::NewSession) => {
+                    if conn.is_busy() {
+                        let _ = conn.cancel_and_wait(incoming, CANCEL_GRACE);
+                    }
+                    if let Ok(mut s) = store.lock() {
+                        s.clear();
+                        s.save();
+                    }
+                    return Exit::Fresh;
                 }
                 Ok(AgentCmd::Cancel) => {
                     if conn.is_busy() {
@@ -267,10 +316,23 @@ enum Downtime {
     Shutdown,
 }
 
-fn wait_or_shutdown(cmd_rx: &Receiver<AgentCmd>, dur: Duration) -> Downtime {
+fn wait_or_shutdown(
+    cmd_rx: &Receiver<AgentCmd>,
+    dur: Duration,
+    store: &Arc<Mutex<Store>>,
+) -> Downtime {
     match cmd_rx.recv_timeout(dur) {
         Ok(AgentCmd::Shutdown) => Downtime::Shutdown,
         Ok(AgentCmd::Switch(next, env)) => Downtime::Switch(next, env),
+        // No connection to cancel, but the request must not be lost: clear now so
+        // whatever connects next starts clean.
+        Ok(AgentCmd::NewSession) => {
+            if let Ok(mut s) = store.lock() {
+                s.clear();
+                s.save();
+            }
+            Downtime::Elapsed
+        }
         Err(RecvTimeoutError::Disconnected) => Downtime::Shutdown, // handle dropped
         // Timeout, or a prompt/cancel we drop while there is no agent to take it.
         _ => Downtime::Elapsed,

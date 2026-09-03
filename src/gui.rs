@@ -205,6 +205,10 @@ struct App {
     /// Reported by the player, not inferred.
     speaking: bool,
     busy: bool,
+    /// How much of the conversation the current connection kept. Shown next to the
+    /// agent, because "which agent" and "does it still remember" are the two
+    /// things a reconnect can change.
+    context: crate::session::Recovery,
     /// Which secrets exist, for the mask. Values are held only to mask them and
     /// are never rendered in full or logged.
     secrets: Vec<(String, String)>,
@@ -256,6 +260,8 @@ impl App {
             talk_down: false,
             speaking: false,
             busy: false,
+            // Nothing has connected yet, so claim nothing.
+            context: crate::session::Recovery::Fresh,
             secrets: crate::setup::load_secrets(),
             key_input: std::collections::HashMap::new(),
         };
@@ -414,6 +420,20 @@ impl App {
                 self.phase = Phase::Restarting;
                 self.rows.push(Row::Error(format!("agent 重启中: {why}")));
             }
+            // Continuity is only worth a line when there was something to lose:
+            // a first run says nothing, a recovery says what it cost.
+            UiEvent::Context(how) => {
+                self.context = how;
+                match how {
+                    crate::session::Recovery::Fresh => {}
+                    crate::session::Recovery::Restored => {
+                        self.rows.push(Row::Notice("上次的会话已接回，上下文都在".into()))
+                    }
+                    crate::session::Recovery::Recapped => self.rows.push(Row::Notice(
+                        "会话没法直接接回，已用对话摘要续上（agent 的中间推理丢了）".into(),
+                    )),
+                }
+            }
             // Speaking outranks Thinking in the light because it is the state the
             // user can hear; when it ends, fall back to whatever the turn is doing.
             UiEvent::Speaking(on) => {
@@ -447,6 +467,21 @@ impl App {
             ui.label(self.phase.label());
             ui.separator();
             ui.weak(format!("“{}”", self.wake_word));
+            // Continuity, where the user already looks for state. Silent on a
+            // fresh start; a badge only when a reconnect changed what is
+            // remembered.
+            match self.context {
+                crate::session::Recovery::Fresh => {}
+                crate::session::Recovery::Restored => {
+                    ui.separator();
+                    ui.weak("上下文已接回").on_hover_text("重连后 session/load 成功，agent 记得之前的对话");
+                }
+                crate::session::Recovery::Recapped => {
+                    ui.separator();
+                    ui.colored_label(egui::Color32::from_rgb(230, 170, 60), "摘要续接")
+                        .on_hover_text("会话无法直接接回，已把对话摘要交给新会话；agent 的中间推理丢了");
+                }
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
                     .selectable_label(self.show_settings, "⚙ 设置")
@@ -761,6 +796,16 @@ impl App {
             }
             if ui.button("✕ 放弃").clicked() {
                 self.send(UiCommand::Abandon);
+            }
+            // Separate from 放弃 on purpose: that drops the current task, this
+            // drops the whole thread. Everything else works to preserve context,
+            // so this is the one place that throws it away.
+            if ui
+                .button("⟲ 新会话")
+                .on_hover_text("忘掉之前的对话，开一个干净的会话")
+                .clicked()
+            {
+                self.send(UiCommand::NewSession);
             }
         });
         ui.add_space(4.0);

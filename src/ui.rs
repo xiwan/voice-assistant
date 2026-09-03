@@ -25,6 +25,7 @@
 //! on stderr as plain `eprintln!`: they happen before a front end exists and
 //! describe the process, not the conversation.
 
+use crate::session::Recovery;
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use std::io::{IsTerminal, Write};
 use std::thread;
@@ -82,6 +83,10 @@ pub enum UiEvent {
     TurnEnd { reason: String },
     /// The supervisor is replacing a dead or wedged agent.
     AgentRestarting(String),
+    /// How much of the conversation survived opening a connection. Emitted on
+    /// every connect, including the first (`Fresh`), so a front end never has to
+    /// guess whether the assistant still remembers what was said.
+    Context(crate::session::Recovery),
     /// A turn is / is no longer running.
     Busy(bool),
     /// The player started or stopped talking. Emitted by the player itself, which
@@ -108,6 +113,9 @@ pub enum UiCommand {
     Resume,
     /// Interrupt and forget the task (算了).
     Abandon,
+    /// Forget the conversation and start a clean session (新会话). Distinct from
+    /// `Abandon`, which drops the current *task* but keeps the thread.
+    NewSession,
     /// Switch to another ACP agent by registry id (kiro / claude / codex /
     /// gemini). Handled without restarting the process: the supervisor drops the
     /// current connection and opens one with the new command.
@@ -220,6 +228,9 @@ impl Ui {
     pub fn restarting(&self, why: &str) {
         self.emit(UiEvent::AgentRestarting(why.to_string()));
     }
+    pub fn context(&self, how: crate::session::Recovery) {
+        self.emit(UiEvent::Context(how));
+    }
     pub fn busy(&self, busy: bool) {
         self.emit(UiEvent::Busy(busy));
     }
@@ -271,6 +282,16 @@ impl Term {
                 );
             }
             UiEvent::AgentReady { cmd } => self.line(w, &format!(">> agent 已连接: {cmd}")),
+            // A first run has nothing to say about continuity; the other three
+            // outcomes are the difference between "it remembers" and "it doesn't",
+            // which the user must not have to infer.
+            UiEvent::Context(how) => match how {
+                Recovery::Fresh => {}
+                Recovery::Restored => self.line(w, ">> 上次的会话已接回，上下文都在"),
+                Recovery::Recapped => {
+                    self.line(w, ">> 会话没法直接接回，已用对话摘要续上（agent 的中间推理丢了）")
+                }
+            },
             UiEvent::NoSpeech => self.line(w, ">> 没听到指令，回到待机"),
             UiEvent::Transcript(text) => self.line(w, &format!(">> you said: {text}")),
             UiEvent::Notice(text) => self.line(w, &format!(">> {text}")),

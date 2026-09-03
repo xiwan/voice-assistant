@@ -20,6 +20,7 @@
 //! spends time thinking or in tools never looks like a hang. Agent-specific
 //! notifications (kiro's `_kiro.dev/*`) are ignored.
 
+use crate::session::{Plan, Recovery, Role, Store};
 use crate::tts::{SpeechBuffer, Tts};
 use crate::ui::{ToolState, Ui};
 use anyhow::{anyhow, bail, Context, Result};
@@ -44,7 +45,9 @@ pub enum Incoming {
 
 pub struct AcpConnection {
     child: Child,
-    stdin: ChildStdin,
+    /// `Option` so `Drop` can close it: EOF on stdin is the only shutdown that
+    /// makes the agent release its session lock (see `Drop`).
+    stdin: Option<ChildStdin>,
     next_id: i64,
     session_id: String,
     /// Request id of the in-flight `session/prompt`, if a turn is running.
@@ -62,6 +65,17 @@ pub struct AcpConnection {
     /// progress — and it is spoken sentence by sentence as the reply streams.
     tts: Tts,
     speech: SpeechBuffer,
+    /// The conversation, persisted across connections. Shared with the supervisor
+    /// so a replacement connection continues where this one stopped.
+    store: Arc<Mutex<Store>>,
+    /// Set while `session/load` is replaying history. kiro-cli replays every past
+    /// turn as `session/update` notifications, so without this the whole
+    /// conversation would be reprinted **and read out loud** on every recovery.
+    replaying: bool,
+    /// Recap to prepend to the next real prompt, when the session itself could not
+    /// be reloaded. Prefixing costs no extra round trip and makes the agent say
+    /// nothing the user did not ask for.
+    pending_recap: Option<String>,
 }
 
 impl AcpConnection {
@@ -79,7 +93,8 @@ impl AcpConnection {
         tts: Tts,
         ui: Ui,
         env: &[(String, String)],
-    ) -> Result<(Self, Receiver<Incoming>)> {
+        store: Arc<Mutex<Store>>,
+    ) -> Result<(Self, Receiver<Incoming>, Recovery)> {
         anyhow::ensure!(!cmd.is_empty(), "agent command is empty");
         let mut child = Command::new(&cmd[0])
             .args(&cmd[1..])
@@ -102,7 +117,7 @@ impl AcpConnection {
         let incoming = spawn_reader(stdout);
         let mut c = Self {
             child,
-            stdin,
+            stdin: Some(stdin),
             next_id: 1,
             session_id: String::new(),
             active_prompt: None,
@@ -110,21 +125,30 @@ impl AcpConnection {
             ui,
             tts,
             speech: SpeechBuffer::default(),
+            store,
+            replaying: false,
+            pending_recap: None,
         };
         // A backend that dies on startup usually explains itself on stderr, but
         // the explanation can land a moment after the pipe closes — hence the
         // short grace before reading the tail.
-        if let Err(e) = c.handshake(&incoming) {
-            thread::sleep(Duration::from_millis(300));
-            let why = first_useful_line(&tail);
-            return Err(match why {
-                Some(line) => anyhow!("{e} — agent 说: {line}"),
-                None => e,
-            });
-        }
-        Ok((c, incoming))
+        let recovered = match c.handshake(&incoming, &cmd.join(" ")) {
+            Ok(r) => r,
+            Err(e) => {
+                thread::sleep(Duration::from_millis(300));
+                let why = first_useful_line(&tail);
+                return Err(match why {
+                    Some(line) => anyhow!("{e} — agent 说: {line}"),
+                    None => e,
+                });
+            }
+        };
+        Ok((c, incoming, recovered))
     }
-    fn handshake(&mut self, incoming: &Receiver<Incoming>) -> Result<()> {
+
+    /// `initialize`, then continue the conversation the best way this backend
+    /// allows: reload its own session, or start a new one seeded with a recap.
+    fn handshake(&mut self, incoming: &Receiver<Incoming>, argv: &str) -> Result<Recovery> {
         let init = self.request_blocking(
             incoming,
             "initialize",
@@ -137,9 +161,36 @@ impl AcpConnection {
         if ver != Some(PROTOCOL_VERSION) {
             eprintln!("[acp] warning: agent protocolVersion {ver:?}, expected {PROTOCOL_VERSION}");
         }
+        // Capabilities were previously ignored, which is why continuity was never
+        // even attempted. `loadSession` is the one we act on.
+        let supports_load = init["agentCapabilities"]["loadSession"].as_bool().unwrap_or(false);
         let cwd = std::env::current_dir()
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|_| ".".to_string());
+
+        let plan = {
+            let store = self.store.lock().expect("session store poisoned");
+            store.plan(argv, supports_load)
+        };
+
+        if let Plan::Load(id) = &plan {
+            match self.load_session(incoming, id, &cwd) {
+                Ok(()) => {
+                    self.session_id = id.clone();
+                    return Ok(Recovery::Restored);
+                }
+                Err(e) => {
+                    // Verified: a session whose owner was killed stays locked to a
+                    // dead PID forever, so this is permanent for that id. Record
+                    // that and continue with a recap rather than retrying.
+                    eprintln!("[acp] session/load 失败，改用摘要续接: {e}");
+                    let mut store = self.store.lock().expect("session store poisoned");
+                    store.mark_unloadable();
+                    store.save();
+                }
+            }
+        }
+
         let newsess =
             self.request_blocking(incoming, "session/new", json!({ "cwd": cwd, "mcpServers": [] }))?;
         self.session_id = newsess
@@ -147,7 +198,41 @@ impl AcpConnection {
             .and_then(Value::as_str)
             .context("session/new returned no sessionId")?
             .to_string();
-        Ok(())
+        {
+            let mut store = self.store.lock().expect("session store poisoned");
+            store.bind(argv, &self.session_id);
+            store.save();
+        }
+
+        // Re-plan is unnecessary: the only reason we are here with history is that
+        // loading was impossible, so the recap is what continuity means now.
+        match self.store.lock().expect("session store poisoned").recap() {
+            Some(recap) => {
+                self.pending_recap = Some(recap);
+                Ok(Recovery::Recapped)
+            }
+            None => Ok(Recovery::Fresh),
+        }
+    }
+
+    /// Take over a session the agent already has. It replays the transcript as
+    /// notifications while doing so, which must stay silent and invisible: the
+    /// user already saw those lines, and hearing the whole conversation read back
+    /// would be worse than losing it.
+    fn load_session(
+        &mut self,
+        incoming: &Receiver<Incoming>,
+        id: &str,
+        cwd: &str,
+    ) -> Result<()> {
+        self.replaying = true;
+        let result = self.request_blocking(
+            incoming,
+            "session/load",
+            json!({ "sessionId": id, "cwd": cwd, "mcpServers": [] }),
+        );
+        self.replaying = false;
+        result.map(|_| ())
     }
 
     /// Send a request and block until its response arrives, handling
@@ -182,15 +267,28 @@ impl AcpConnection {
 
     /// Start a new prompt turn (non-blocking). Records the request id so the
     /// matching response can be recognised as the turn's end.
+    ///
+    /// What the *user* said is recorded verbatim; a pending recap is prepended to
+    /// what the *agent* receives, so the stored transcript never accumulates
+    /// recaps of recaps.
     pub fn send_prompt(&mut self, text: &str) -> Result<()> {
         let id = self.next_id;
         self.next_id += 1;
         self.active_prompt = Some(id);
         self.speech.reset();
+        {
+            let mut store = self.store.lock().expect("session store poisoned");
+            store.record(Role::User, text);
+            store.save();
+        }
+        let sent = match self.pending_recap.take() {
+            Some(recap) => format!("{recap}{text}"),
+            None => text.to_string(),
+        };
         let session_id = self.session_id.clone();
         self.send(&json!({
             "jsonrpc": "2.0", "id": id, "method": "session/prompt",
-            "params": { "sessionId": session_id, "prompt": [{ "type": "text", "text": text }] },
+            "params": { "sessionId": session_id, "prompt": [{ "type": "text", "text": sent }] },
         }))
     }
 
@@ -261,6 +359,10 @@ impl AcpConnection {
                     };
                     // Lets the front end close a half-written line.
                     self.ui.turn_end(&stop);
+                    // The turn is over: persist the thread. Saving here rather
+                    // than per chunk keeps one write per turn instead of one per
+                    // token, and a turn is the smallest unit worth resuming from.
+                    self.store.lock().expect("session store poisoned").save();
                     // Speak the tail of the reply (a last sentence without
                     // final punctuation). A cancelled or failed turn stays silent.
                     match self.speech.flush() {
@@ -284,10 +386,20 @@ impl AcpConnection {
     // ---- session/update -> events ----
 
     fn render_update(&mut self, update: &Value) {
+        // `session/load` replays the entire history through this same path. The
+        // user has already seen it, and speaking it would read the whole
+        // conversation back at them, so a replay produces no output at all.
+        if self.replaying {
+            return;
+        }
         match update.get("sessionUpdate").and_then(Value::as_str).unwrap_or("") {
             "agent_message_chunk" => {
                 if let Some(text) = update["content"]["text"].as_str() {
                     self.ui.reply(text);
+                    self.store
+                        .lock()
+                        .expect("session store poisoned")
+                        .record(Role::Agent, text);
                     // Reply text is the ONLY thing spoken; each sentence goes
                     // out as soon as it is complete, not at end of turn.
                     for sentence in self.speech.push(text) {
@@ -319,10 +431,11 @@ impl AcpConnection {
 
     fn send(&mut self, msg: &Value) -> Result<()> {
         let line = serde_json::to_string(msg)?;
-        self.stdin
+        let stdin = self.stdin.as_mut().context("agent stdin already closed")?;
+        stdin
             .write_all(line.as_bytes())
-            .and_then(|_| self.stdin.write_all(b"\n"))
-            .and_then(|_| self.stdin.flush())
+            .and_then(|_| stdin.write_all(b"\n"))
+            .and_then(|_| stdin.flush())
             .context("failed writing to agent stdin (process gone?)")?;
         Ok(())
     }
@@ -357,11 +470,32 @@ impl AcpConnection {
     }
 }
 
+/// How long a replaced agent gets to exit on its own after stdin is closed.
+/// Generous enough for a clean exit, short enough that a wedged backend does not
+/// delay the replacement the user is waiting for.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+
 impl Drop for AcpConnection {
     fn drop(&mut self) {
-        // Terminate the agent process and reap it (no zombies). This is what
-        // enforces the "at most one" half of the supervisor's invariant: a
-        // connection is never replaced without its child being killed+waited.
+        // Terminate the agent and reap it (no zombies). This is what enforces the
+        // "at most one" half of the supervisor's invariant: a connection is never
+        // replaced without its child being killed+waited.
+        //
+        // Closing stdin first is not politeness, it is what makes the *next*
+        // connection able to continue the conversation. Measured against kiro-cli
+        // 2.21.0 (`scratch/try_session_lock.py`): after an EOF exit, `session/load`
+        // works; after SIGTERM or SIGKILL the session stays locked to a PID that
+        // no longer exists, and that lock never expires — the session is then
+        // unloadable forever and continuity has to fall back to a recap.
+        drop(self.stdin.take());
+        let deadline = Instant::now() + SHUTDOWN_GRACE;
+        while Instant::now() < deadline {
+            match self.child.try_wait() {
+                Ok(Some(_)) => return, // exited on its own: lock released
+                Ok(None) => thread::sleep(Duration::from_millis(25)),
+                Err(_) => break,
+            }
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
     }

@@ -26,6 +26,7 @@ mod agents;
 mod asr;
 mod audio;
 mod gui;
+mod session;
 mod setup;
 mod tts;
 mod ui;
@@ -37,7 +38,7 @@ use anyhow::Result;
 use crossbeam_channel::{never, select, Receiver};
 use std::io::IsTerminal;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use ui::{Ui, UiCommand};
 use vad::VAD_CHUNK;
@@ -181,7 +182,7 @@ fn main() -> Result<()> {
     // the binary links and starts on a machine with no models and no mic.
     const CMDS: &[&str] = &[
         "selftest", "vad-wav", "test-wake", "test-vad", "test-asr", "test-tts", "ask",
-        "agent-test", "events", "gui", "agents",
+        "agent-test", "session-test", "events", "gui", "agents",
     ];
     if let Some(other) = std::env::args().nth(1) {
         if !CMDS.contains(&other.as_str()) {
@@ -199,6 +200,7 @@ fn main() -> Result<()> {
         Some("test-tts") => test_tts(&cfg),
         Some("ask") => ask_cli(&cfg),
         Some("agent-test") => agent_test(&cfg),
+        Some("session-test") => session_test(&cfg),
         Some("events") => events_cli(&cfg),
         Some("gui") => gui::run(cfg),
         Some("agents") => agents_cli(&cfg),
@@ -240,17 +242,26 @@ enum Intent {
     Resume,
     /// Interrupt the running task but remember it so it can be resumed.
     Pause,
+    /// Deliberately start over: forget the conversation and open a clean session.
+    /// Everything else in this program tries to preserve context, so losing it has
+    /// to be asked for explicitly.
+    NewSession,
     /// A normal request.
     New,
 }
 
-/// Classify a transcript. Order matters: "不用继续了" is Abandon, not Resume.
+/// Classify a transcript. Order matters: "不用继续了" is Abandon, not Resume, and
+/// "重新开始" is a new session rather than a resume of anything.
 fn classify_intent(text: &str) -> Intent {
+    const NEW_SESSION: &[&str] =
+        &["新会话", "新的会话", "重新开始", "清空上下文", "清空对话", "重置对话", "忘掉刚才", "忘记刚才"];
     const ABANDON: &[&str] = &["算了", "取消", "不用了", "不做了", "别做了", "别弄了", "不用继续"];
     const RESUME: &[&str] = &["继续", "接着", "接下去", "接上"];
     const PAUSE: &[&str] = &["暂停", "等等", "等一下", "等下", "稍等", "停一下", "先停", "停下", "停"];
     let t = text.to_lowercase();
-    if ABANDON.iter().any(|w| t.contains(w)) {
+    if NEW_SESSION.iter().any(|w| t.contains(w)) {
+        Intent::NewSession
+    } else if ABANDON.iter().any(|w| t.contains(w)) {
         Intent::Abandon
     } else if RESUME.iter().any(|w| t.contains(w)) {
         Intent::Resume
@@ -271,14 +282,22 @@ fn resume_prompt(task: &str) -> String {
 }
 
 /// Block until the agent finishes the current turn (or dies), printing restarts.
-fn wait_for_idle(agent: &AgentHandle) {
+/// Returns the continuity outcome the connection reported, which is the only way
+/// a headless caller can see whether the conversation carried over.
+fn wait_for_idle(agent: &AgentHandle) -> Option<session::Recovery> {
+    let mut context = None;
     for st in agent.state_rx.iter() {
         match st {
-            AgentState::Idle(_) => return,
+            AgentState::Idle(_) => return context,
             AgentState::Restarting(r) => eprintln!(">> agent 重启中: {r}"),
+            AgentState::Context(how) => {
+                eprintln!(">> 上下文: {how:?}");
+                context = Some(how);
+            }
             _ => {}
         }
     }
+    context
 }
 
 /// Headless ACP check (no mic): spawn the supervised agent and send each
@@ -295,12 +314,15 @@ fn ask_cli(cfg: &Config) -> Result<()> {
         Ui::terminal(&cfg.persona),
     );
     let agent = AgentHandle::spawn(
-        cfg.agent_cmd.clone(),
-        cfg.auto_approve.clone(),
-        speaker.clone(),
-        Ui::terminal(&cfg.persona),
-        agent_env(&cfg.agent_cmd),
-    );
+            cfg.agent_cmd.clone(),
+            cfg.auto_approve.clone(),
+            speaker.clone(),
+            Ui::terminal(&cfg.persona),
+            agent_env(&cfg.agent_cmd),
+            // A debug subcommand must neither inherit the voice conversation nor
+            // overwrite it, so it gets a store that reads and writes nothing.
+            Arc::new(Mutex::new(session::Store::ephemeral())),
+        );
     for (i, p) in prompts.iter().enumerate() {
         println!("\n>> [{}] {p}", i + 1);
         agent.prompt(p.clone());
@@ -327,12 +349,15 @@ fn agent_test(cfg: &Config) -> Result<()> {
         Ui::terminal(&cfg.persona),
     );
     let agent = AgentHandle::spawn(
-        cfg.agent_cmd.clone(),
-        cfg.auto_approve.clone(),
-        silent,
-        Ui::terminal(&cfg.persona),
-        agent_env(&cfg.agent_cmd),
-    );
+            cfg.agent_cmd.clone(),
+            cfg.auto_approve.clone(),
+            silent,
+            Ui::terminal(&cfg.persona),
+            agent_env(&cfg.agent_cmd),
+            // A debug subcommand must neither inherit the voice conversation nor
+            // overwrite it, so it gets a store that reads and writes nothing.
+            Arc::new(Mutex::new(session::Store::ephemeral())),
+        );
 
     // Consume states until the next Idle, printing each transition. Returns the
     // stopReason, or None if the agent channel closed.
@@ -387,12 +412,15 @@ fn events_cli(cfg: &Config) -> Result<()> {
         Ui::terminal(&cfg.persona),
     );
     let agent = AgentHandle::spawn(
-        cfg.agent_cmd.clone(),
-        cfg.auto_approve.clone(),
-        silent,
-        ui.clone(),
-        agent_env(&cfg.agent_cmd),
-    );
+            cfg.agent_cmd.clone(),
+            cfg.auto_approve.clone(),
+            silent,
+            ui.clone(),
+            agent_env(&cfg.agent_cmd),
+            // A debug subcommand must neither inherit the voice conversation nor
+            // overwrite it, so it gets a store that reads and writes nothing.
+            Arc::new(Mutex::new(session::Store::ephemeral())),
+        );
 
     // A front end also sees what the state machine reports, not just the agent.
     // Say plainly how listening starts. In ptt mode nothing at all happens until
@@ -483,12 +511,15 @@ fn agents_cli(cfg: &Config) -> Result<()> {
     );
     eprintln!("\n[1] 当前 agent: {}", cfg.agent_cmd.join(" "));
     let agent = AgentHandle::spawn(
-        cfg.agent_cmd.clone(),
-        cfg.auto_approve.clone(),
-        silent,
-        ui.clone(),
-        agent_env(&cfg.agent_cmd),
-    );
+            cfg.agent_cmd.clone(),
+            cfg.auto_approve.clone(),
+            silent,
+            ui.clone(),
+            agent_env(&cfg.agent_cmd),
+            // A debug subcommand must neither inherit the voice conversation nor
+            // overwrite it, so it gets a store that reads and writes nothing.
+            Arc::new(Mutex::new(session::Store::ephemeral())),
+        );
     let q = "你是什么模型？只回答模型或产品名，一行以内。";
     agent.prompt(q.into());
     wait_for_idle(&agent);
@@ -537,7 +568,17 @@ fn run_with(cfg: &Config, ui: Ui, commands: Receiver<UiCommand>) -> Result<()> {
     let launch = fallback_if_unusable(cfg, &ui);
     eprintln!("[acp] starting agent: {}", launch.join(" "));
     let env = agent_env(&launch);
-    let agent = AgentHandle::spawn(launch, cfg.auto_approve.clone(), speaker.clone(), ui.clone(), env);
+    // The conversation outlives any single agent process: this store is what the
+    // next connection consults to continue (reload the session, or recap it).
+    let store = Arc::new(Mutex::new(session::Store::load()));
+    let agent = AgentHandle::spawn(
+        launch,
+        cfg.auto_approve.clone(),
+        speaker.clone(),
+        ui.clone(),
+        env,
+        store,
+    );
 
     // Say plainly how listening starts. In ptt mode nothing at all happens until
     // a key is held in a focused window, which is indistinguishable from a hang
@@ -586,6 +627,17 @@ fn run_with(cfg: &Config, ui: Ui, commands: Receiver<UiCommand>) -> Result<()> {
                     ui.restarting(&r);
                     conv.busy = false;
                     ui.busy(false);
+                }
+                // A new connection reports what survived. This matters here and
+                // not just cosmetically: `conv.resumable` is held by this loop and
+                // is sticky, so "继续" after a reconnect must not promise the agent
+                // knows how far it got when it does not — under agent_mode=full it
+                // acts on what it is told.
+                AgentState::Context(how) => {
+                    ui.context(how);
+                    if how == session::Recovery::Recapped && conv.resumable.is_some() {
+                        ui.notice("提醒：会话是用摘要接回的，“继续”会基于摘要重来，可能重复已做过的部分");
+                    }
                 }
                 // The supervisor has given up on this backend. It cannot pick a
                 // replacement (it knows nothing about the registry), so we do.
@@ -942,6 +994,7 @@ fn from_command(cmd: UiCommand) -> (Intent, String) {
         UiCommand::Pause => (Intent::Pause, String::new()),
         UiCommand::Resume => (Intent::Resume, String::new()),
         UiCommand::Abandon | UiCommand::Quit => (Intent::Abandon, String::new()),
+        UiCommand::NewSession => (Intent::NewSession, String::new()),
         // Reached only if a caller forgets to intercept these; abandoning is the
         // conservative reading (do not leave a task running against an agent
         // that is being replaced, or through a settings change).
@@ -1000,6 +1053,16 @@ fn act(
             conv.resumable = None;
             ui.notice("好的，取消了");
         }
+        Intent::NewSession => {
+            if conv.busy {
+                agent.cancel();
+            }
+            conv.busy = false;
+            conv.current_task = None;
+            conv.resumable = None;
+            agent.new_session();
+            ui.notice("好的，从头开始，之前的对话我不再带着了");
+        }
         Intent::New => {
             ui.notice("asking agent...");
             agent.prompt(text.clone());
@@ -1008,6 +1071,130 @@ fn act(
             // resumable stays sticky: this may be an interjection while paused
         }
     }
+}
+
+/// Hidden end-to-end check of conversation continuity (v0.20.0).
+///
+/// Unit tests can prove the policy but not the two facts that actually decide
+/// whether continuity works: that the agent releases its session lock when we
+/// close stdin, and that reloading a session does not reprint or speak the
+/// replayed history. Both need a real agent, so this drives one.
+///
+/// Runs entirely through `AgentHandle`, i.e. the same path the voice loop uses.
+/// Point `VA_SESSION_FILE` at a scratch file to keep the real conversation out of
+/// it (the command insists on that, rather than trusting the caller to remember).
+fn session_test(cfg: &Config) -> Result<()> {
+    let store_path = session::Store::path();
+    anyhow::ensure!(
+        std::env::var("VA_SESSION_FILE").is_ok(),
+        "refusing to run against the real conversation store ({}). \
+         Set VA_SESSION_FILE=/tmp/va-session-test.json first.",
+        store_path.display()
+    );
+    let _ = std::fs::remove_file(&store_path);
+    sync_persona(cfg);
+
+    let secret = "4173";
+    let (ui, events) = Ui::channel();
+    // Collect what a front end would show, so the replay-suppression claim is
+    // checked rather than asserted.
+    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+    let sink = seen.clone();
+    std::thread::spawn(move || {
+        for ev in events.iter() {
+            if let ui::UiEvent::Reply(text) = &ev {
+                if let Ok(mut s) = sink.lock() {
+                    s.push(text.clone());
+                }
+            }
+            if let ui::UiEvent::Context(how) = &ev {
+                eprintln!("[session-test] 恢复结果: {how:?}");
+            }
+        }
+    });
+
+    let round = |prompt: &str| -> Result<Option<session::Recovery>> {
+        let silent = tts::Tts::spawn(
+            tts::Engine::Off,
+            Arc::new(AtomicBool::new(false)),
+            ui.clone(),
+        );
+        let store = Arc::new(Mutex::new(session::Store::load()));
+        let agent = AgentHandle::spawn(
+            cfg.agent_cmd.clone(),
+            cfg.auto_approve.clone(),
+            silent.clone(),
+            ui.clone(),
+            agent_env(&cfg.agent_cmd),
+            store,
+        );
+        eprintln!("\n[session-test] >> {prompt}");
+        agent.prompt(prompt.to_string());
+        let how = wait_for_idle(&agent);
+        // Shutdown is the interesting part: it must close stdin and let the agent
+        // exit, or the session stays locked to a dead PID forever.
+        agent.shutdown();
+        silent.shutdown();
+        std::thread::sleep(Duration::from_millis(1500));
+        Ok(how)
+    };
+
+    let recall = "我刚才让你记住的数字是多少？只回答数字，不要用任何工具。";
+    round(&format!("记住这个数字：{secret}。只回答「记住了」，不要用任何工具。"))?;
+    let before = seen.lock().expect("poisoned").len();
+    let reloaded = round(recall)?;
+
+    let replies = seen.lock().expect("poisoned").clone();
+    let second_round: String = replies[before..].concat();
+    let replayed_first_round = second_round.contains("记住了");
+    println!("\n[1] 干净关闭后重连");
+    println!("    第二轮回答: {}", second_round.trim());
+    println!(
+        "    上下文续上: {}",
+        if second_round.contains(secret) { "✅ 是" } else { "❌ 否" }
+    );
+    println!(
+        "    重放被抑制: {}",
+        if replayed_first_round { "❌ 历史被重新输出（会被朗读）" } else { "✅ 是" }
+    );
+    // Which mechanism kicked in depends on the backend, so it is reported rather
+    // than demanded: only agents advertising `loadSession` can be resumed at the
+    // protocol level. Continuity itself is not optional either way.
+    match reloaded {
+        Some(session::Recovery::Restored) => println!("    机制: session/load（协议级接回）"),
+        Some(session::Recovery::Recapped) => {
+            println!("    机制: 摘要续接（该后端不支持 session/load，或锁没释放）")
+        }
+        other => anyhow::bail!("重连后既没接回也没摘要续接: {other:?}"),
+    }
+    anyhow::ensure!(second_round.contains(secret), "上下文没有续上");
+    anyhow::ensure!(!replayed_first_round, "session/load 的历史重放没有被抑制");
+
+    // Now the degraded path: a session id the backend will not hand back. This is
+    // what a crash (stale lock) and a switch to another backend both look like
+    // from here, and it must still continue the conversation — via our own
+    // transcript, prefixed to the prompt.
+    {
+        let mut s = session::Store::load();
+        s.bind(&cfg.agent_cmd.join(" "), "00000000-0000-0000-0000-000000000000");
+        s.save();
+    }
+    let mark = seen.lock().expect("poisoned").len();
+    let recapped = round(recall)?;
+    let third_round: String = seen.lock().expect("poisoned")[mark..].concat();
+    println!("\n[2] 会话无法接回时的摘要续接（崩溃 / 换后端同一条路）");
+    println!("    第三轮回答: {}", third_round.trim());
+    println!("    恢复结果: {recapped:?}");
+    println!(
+        "    摘要救回上下文: {}",
+        if third_round.contains(secret) { "✅ 是" } else { "❌ 否" }
+    );
+    anyhow::ensure!(
+        recapped == Some(session::Recovery::Recapped),
+        "预期降级到摘要，实际是 {recapped:?}"
+    );
+    anyhow::ensure!(third_round.contains(secret), "摘要没有把上下文带过去");
+    Ok(())
 }
 
 /// The slice of `Config` a front end may move while the pipeline runs.
@@ -1398,6 +1585,22 @@ mod tests {
         }
     }
 
+    /// Forgetting is the one thing that must be asked for explicitly, so its
+    /// phrases have to win over the ones that merely stop a task.
+    #[test]
+    fn new_session_words() {
+        for s in ["新会话", "重新开始", "清空上下文", "咱们重新开始吧", "忘掉刚才的"] {
+            assert_eq!(classify_intent(s), Intent::NewSession, "{s}");
+        }
+    }
+
+    /// "重新开始" contains neither 继续 nor 算了, but "重新开始，别做了" contains
+    /// both intents' words — the reset must not be downgraded to an abandon.
+    #[test]
+    fn a_reset_outranks_an_abandon() {
+        assert_eq!(classify_intent("重新开始，之前的不用了"), Intent::NewSession);
+    }
+
     #[test]
     fn resume_prompt_restates_task() {
         let p = resume_prompt("把报告写完");
@@ -1416,6 +1619,7 @@ mod tests {
         assert_eq!(from_command(UiCommand::Pause).0, Intent::Pause);
         assert_eq!(from_command(UiCommand::Resume).0, Intent::Resume);
         assert_eq!(from_command(UiCommand::Abandon).0, Intent::Abandon);
+        assert_eq!(from_command(UiCommand::NewSession).0, Intent::NewSession);
         // Quit tears the pipeline down in the caller; if it ever gets here it
         // must at least not leave a task running.
         assert_eq!(from_command(UiCommand::Quit).0, Intent::Abandon);
