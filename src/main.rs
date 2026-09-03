@@ -395,6 +395,17 @@ fn events_cli(cfg: &Config) -> Result<()> {
     );
 
     // A front end also sees what the state machine reports, not just the agent.
+    // Say plainly how listening starts. In ptt mode nothing at all happens until
+    // a key is held in a focused window, which is indistinguishable from a hang
+    // if you do not know that.
+    if cfg.push_to_talk {
+        eprintln!(
+            "[listen] 按住说话模式：按住 {} 说（需要窗口有焦点）",
+            cfg.ptt_key
+        );
+    } else {
+        eprintln!("[listen] 常听模式：说“{}”唤醒", cfg.wake_display);
+    }
     ui.ready(&cfg.wake_display);
     ui.transcript(&prompt);
     ui.busy(true);
@@ -528,6 +539,17 @@ fn run_with(cfg: &Config, ui: Ui, commands: Receiver<UiCommand>) -> Result<()> {
     let env = agent_env(&launch);
     let agent = AgentHandle::spawn(launch, cfg.auto_approve.clone(), speaker.clone(), ui.clone(), env);
 
+    // Say plainly how listening starts. In ptt mode nothing at all happens until
+    // a key is held in a focused window, which is indistinguishable from a hang
+    // if you do not know that.
+    if cfg.push_to_talk {
+        eprintln!(
+            "[listen] 按住说话模式：按住 {} 说（需要窗口有焦点）",
+            cfg.ptt_key
+        );
+    } else {
+        eprintln!("[listen] 常听模式：说“{}”唤醒", cfg.wake_display);
+    }
     ui.ready(&cfg.wake_display);
 
     // Live-adjustable parameters, seeded from config and moved by the settings UI.

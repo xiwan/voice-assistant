@@ -44,6 +44,16 @@ pub fn run(cfg: crate::Config) -> anyhow::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([960.0, 640.0])
             .with_min_inner_size([560.0, 380.0])
+            // Pin the first placement near the primary display's top-left.
+            // Without this macOS cascaded the window onto a secondary monitor —
+            // observed at y=-1220 on a two-display setup, i.e. completely
+            // invisible to someone looking at the laptop screen, which reads as
+            // "the app does nothing".
+            .with_position([100.0, 100.0])
+            // Take focus on open: in push-to-talk mode the key only works while
+            // this window is focused, so a window you have to hunt for and click
+            // is a broken feature.
+            .with_active(true)
             .with_title(format!("{} · voice assistant", cfg.persona)),
         ..Default::default()
     };
