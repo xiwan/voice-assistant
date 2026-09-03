@@ -31,9 +31,43 @@ pub struct Kind {
     pub adapter_bin: Option<&'static str>,
     /// npm package that provides that adapter.
     pub adapter_pkg: Option<&'static str>,
-    /// How the user installs the CLI itself (shown, never run automatically).
-    pub install_cli: &'static str,
+    /// How the underlying CLI gets installed.
+    pub install: Install,
 }
+
+/// Whether this program can install the agent's CLI itself.
+///
+/// npm-distributed CLIs can be installed with one command; kiro-cli is a signed
+/// download plus a login, so pretending there is a button for it would be a lie.
+pub enum Install {
+    /// `npm install -g <pkg>`.
+    Npm(&'static str),
+    /// Nothing to run — show this to the user instead.
+    Manual(&'static str),
+}
+
+impl Install {
+    /// Human-readable description, shown either way.
+    pub fn hint(&self) -> String {
+        match self {
+            Install::Npm(pkg) => format!("npm install -g {pkg}"),
+            Install::Manual(text) => text.to_string(),
+        }
+    }
+
+    pub fn argv(&self) -> Option<Vec<String>> {
+        match self {
+            Install::Npm(pkg) => Some(
+                ["npm", "install", "-g", pkg]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+            ),
+            Install::Manual(_) => None,
+        }
+    }
+}
+
 
 /// Package names and flags verified against the npm registry and each project's
 /// own docs on 2026-09-03, not from memory:
@@ -48,7 +82,7 @@ pub const KINDS: &[Kind] = &[
         // Speaks ACP natively, and this program manages its agent file.
         adapter_bin: None,
         adapter_pkg: None,
-        install_cli: "https://kiro.dev (安装后 kiro-cli login)",
+        install: Install::Manual("从 https://kiro.dev 下载安装，然后 kiro-cli login"),
     },
     Kind {
         id: "claude",
@@ -56,7 +90,7 @@ pub const KINDS: &[Kind] = &[
         cli: "claude",
         adapter_bin: Some("claude-agent-acp"),
         adapter_pkg: Some("@agentclientprotocol/claude-agent-acp"),
-        install_cli: "npm install -g @anthropic-ai/claude-code",
+        install: Install::Npm("@anthropic-ai/claude-code"),
     },
     Kind {
         id: "codex",
@@ -64,7 +98,7 @@ pub const KINDS: &[Kind] = &[
         cli: "codex",
         adapter_bin: Some("codex-acp"),
         adapter_pkg: Some("@agentclientprotocol/codex-acp"),
-        install_cli: "npm install -g @openai/codex",
+        install: Install::Npm("@openai/codex"),
     },
     Kind {
         id: "gemini",
@@ -73,7 +107,7 @@ pub const KINDS: &[Kind] = &[
         // ACP is built in behind a flag.
         adapter_bin: None,
         adapter_pkg: None,
-        install_cli: "npm install -g @google/gemini-cli",
+        install: Install::Npm("@google/gemini-cli"),
     },
 ];
 
@@ -211,7 +245,7 @@ mod tests {
     fn every_kind_is_addressable_and_documented() {
         for k in KINDS {
             assert!(find(k.id).is_some(), "{} not findable", k.id);
-            assert!(!k.install_cli.is_empty(), "{} has no install hint", k.id);
+            assert!(!k.install.hint().is_empty(), "{} has no install hint", k.id);
             // An adapter binary without its package would be undiagnosable.
             assert_eq!(
                 k.adapter_bin.is_some(),

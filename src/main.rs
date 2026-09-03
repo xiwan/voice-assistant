@@ -411,7 +411,7 @@ fn agents_cli(cfg: &Config) -> Result<()> {
         println!("[{}] {} — {}", if st.usable() { "ok" } else { "!!" }, k.label, st.label());
         println!("    启动: {}", agents::argv(k, &cfg.agent_mode).join(" "));
         match st {
-            agents::State::NeedsCli => println!("    安装 CLI: {}", k.install_cli),
+            agents::State::NeedsCli => println!("    安装 CLI: {}", k.install.hint()),
             agents::State::NeedsAdapter | agents::State::ViaNpx => {
                 if let Some(cmd) = agents::install_argv(k) {
                     println!("    安装适配器: {}", cmd.join(" "));
@@ -572,7 +572,11 @@ fn run_with(cfg: &Config, ui: Ui, commands: Receiver<UiCommand>) -> Result<()> {
                         continue;
                     }
                     Ok(UiCommand::InstallAdapter(id)) => {
-                        install_adapter(&id, &ui);
+                        install(&id, false, &ui);
+                        continue;
+                    }
+                    Ok(UiCommand::InstallCli(id)) => {
+                        install(&id, true, &ui);
                         continue;
                     }
                     Ok(cmd) => {
@@ -657,34 +661,51 @@ fn switch_agent(id: &str, agent: &AgentHandle, ui: &Ui, cfg: &Config) {
     }
 }
 
-/// Install an agent's ACP adapter globally.
+/// Install an agent's CLI or its ACP adapter.
 ///
-/// This runs `npm install -g <package>`, i.e. it fetches and executes
-/// third-party code — so it only ever happens because the user asked for it, the
-/// exact command is reported before it runs, and the result (including npm's own
-/// error output) is reported back. It runs on its own thread: npm takes tens of
-/// seconds and the pipeline must keep listening.
-fn install_adapter(id: &str, ui: &Ui) {
+/// Runs `npm install -g <package>`, i.e. it fetches and executes third-party
+/// code — so it only happens because the user asked, the exact command is
+/// reported before it runs, and npm's own error output is reported back. It runs
+/// on its own thread: npm takes tens of seconds and the pipeline must keep
+/// listening. kiro-cli is a signed download plus a login, so it has no argv and
+/// the hint is shown instead of pretending a button exists.
+fn install(id: &str, cli: bool, ui: &Ui) {
     let Some(kind) = agents::find(id) else {
         ui.error(format!("未知 agent: {id}"));
         return;
     };
-    let Some(cmd) = agents::install_argv(kind) else {
-        ui.notice(format!("{} 无需适配器", kind.label));
-        return;
+    let cmd = if cli {
+        match kind.install.argv() {
+            Some(c) => c,
+            None => {
+                ui.notice(format!("{} 需要手动安装: {}", kind.label, kind.install.hint()));
+                return;
+            }
+        }
+    } else {
+        match agents::install_argv(kind) {
+            Some(c) => c,
+            None => {
+                ui.notice(format!("{} 无需适配器", kind.label));
+                return;
+            }
+        }
     };
     ui.notice(format!("正在安装: {}（可能要几十秒）", cmd.join(" ")));
     let ui = ui.clone();
     let label = kind.label.to_string();
+    let what = if cli { "CLI" } else { "适配器" };
     std::thread::spawn(move || {
         match std::process::Command::new(&cmd[0]).args(&cmd[1..]).output() {
-            Ok(out) if out.status.success() => {
-                ui.notice(format!("{label} 适配器安装完成，现在可以切换过去"))
-            }
+            Ok(out) if out.status.success() => ui.notice(format!(
+                "{label} {what} 安装完成{}",
+                if what == "CLI" { "，可能还需要登录后才能用" } else { "，现在可以切换过去" }
+            )),
             Ok(out) => {
+                // npm puts the useful line at the end of a long log.
                 let err = String::from_utf8_lossy(&out.stderr);
                 let tail = err.lines().rev().take(2).collect::<Vec<_>>().join(" ");
-                ui.error(format!("安装失败: {}", ui::truncate(&tail)));
+                ui.error(format!("{label} {what} 安装失败: {}", ui::truncate(&tail)));
             }
             Err(e) => ui.error(format!("无法执行 npm: {e}")),
         }
@@ -730,7 +751,9 @@ fn from_command(cmd: UiCommand) -> (Intent, String) {
         // conservative reading (do not leave a task running against an agent
         // that is being replaced, or through a settings change).
         UiCommand::SwitchAgent(_) => (Intent::Abandon, String::new()),
-        UiCommand::Tune(_) | UiCommand::InstallAdapter(_) => (Intent::Abandon, String::new()),
+        UiCommand::Tune(_) | UiCommand::InstallAdapter(_) | UiCommand::InstallCli(_) => {
+            (Intent::Abandon, String::new())
+        }
     }
 }
 

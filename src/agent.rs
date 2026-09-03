@@ -112,6 +112,10 @@ fn supervisor(
             Ok((mut conn, incoming)) => {
                 backoff = BACKOFF_START; // healthy connection resets backoff
                 let _ = state_tx.send(AgentState::Ready);
+                // Report the argv that actually connected: a switch request is
+                // not evidence that the switch happened, and a front end has no
+                // other way to know which agent it is now talking to.
+                ui.agent_ready(&cmd.join(" "));
                 match run_connection(&mut conn, &incoming, &cmd_rx, &state_tx) {
                     Exit::Shutdown => {
                         drop(conn); // kill + reap

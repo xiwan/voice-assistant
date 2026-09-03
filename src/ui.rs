@@ -54,6 +54,11 @@ pub enum ToolState {
 pub enum UiEvent {
     /// Pipeline is up and waiting for the wake word.
     Ready { wake_word: String },
+    /// A connection to an agent was established and the ACP handshake completed.
+    /// Carries the argv that actually started, which is the only trustworthy
+    /// answer to "which agent am I talking to now" — a switch request is not
+    /// evidence that the switch worked.
+    AgentReady { cmd: String },
     /// Score of an evaluated wake-word window, including the ones below the
     /// threshold — this is the data a level meter needs. Terminals ignore it.
     WakeScore(f32),
@@ -110,6 +115,8 @@ pub enum UiCommand {
     /// Install an agent's ACP adapter (`npm install -g …`). Separate from
     /// switching because it runs third-party code and takes a while.
     InstallAdapter(String),
+    /// Install the agent's own CLI, for the npm-distributed ones.
+    InstallCli(String),
     /// Shut the pipeline down.
     Quit,
 }
@@ -163,6 +170,9 @@ impl Ui {
 
     pub fn ready(&self, wake_word: &str) {
         self.emit(UiEvent::Ready { wake_word: wake_word.to_string() });
+    }
+    pub fn agent_ready(&self, cmd: &str) {
+        self.emit(UiEvent::AgentReady { cmd: cmd.to_string() });
     }
     pub fn wake_score(&self, score: f32) {
         self.emit(UiEvent::WakeScore(score));
@@ -244,6 +254,7 @@ impl Term {
                     &format!("\x07>> wake word detected (score {score:.2}){hint}, listening..."),
                 );
             }
+            UiEvent::AgentReady { cmd } => self.line(w, &format!(">> agent 已连接: {cmd}")),
             UiEvent::NoSpeech => self.line(w, ">> 没听到指令，回到待机"),
             UiEvent::Transcript(text) => self.line(w, &format!(">> you said: {text}")),
             UiEvent::Notice(text) => self.line(w, &format!(">> {text}")),

@@ -247,6 +247,24 @@ impl App {
                 self.wake_word = wake_word;
                 self.phase = Phase::Idle;
             }
+            // The only trustworthy source for "which agent is running": the
+            // supervisor reports the argv that actually completed a handshake.
+            UiEvent::AgentReady { cmd } => {
+                let argv: Vec<String> = cmd.split_whitespace().map(String::from).collect();
+                let switched = cmd != self.agent_cmd;
+                self.agent_cmd = cmd;
+                self.agent_id = agents::id_of(&argv).unwrap_or("custom").to_string();
+                if switched {
+                    let label = agents::find(&self.agent_id).map(|k| k.label).unwrap_or("自定义");
+                    self.rows.push(Row::Notice(format!("已连接 {label}：{}", self.agent_cmd)));
+                }
+                if self.phase == Phase::Restarting {
+                    self.phase = Phase::Idle; // connected, so stop saying 重启中
+                }
+                if self.show_settings {
+                    self.refresh_agents();
+                }
+            }
             UiEvent::WakeScore(s) => self.wake_score = s,
             UiEvent::Wake { .. } => self.phase = Phase::Awake,
             UiEvent::NoSpeech => {
@@ -414,6 +432,7 @@ impl App {
         // before any command mutates self.
         let mut switch_to: Option<&'static str> = None;
         let mut install: Option<&'static str> = None;
+        let mut install_cli: Option<&'static str> = None;
         for (kind, state) in &self.agent_states {
             ui.horizontal(|ui| {
                 let selected = self.agent_id == kind.id;
@@ -445,10 +464,18 @@ impl App {
                                 install = Some(kind.id);
                             }
                         }
-                        // No CLI: only the user can install and log into it, so
-                        // show the command instead of pretending to help.
+                        // No CLI yet. npm-distributed ones can be installed from
+                        // here; kiro-cli is a signed download plus a login, so it
+                        // shows the instruction instead of a button that lies.
                         agents::State::NeedsCli => {
-                            ui.weak(kind.install_cli);
+                            if kind.install.argv().is_some() {
+                                if ui.button("安装").clicked() {
+                                    install_cli = Some(kind.id);
+                                }
+                                ui.weak(kind.install.hint());
+                            } else {
+                                ui.weak(kind.install.hint());
+                            }
                         }
                         _ => {}
                     }
@@ -456,11 +483,19 @@ impl App {
             });
         }
         if let Some(id) = switch_to {
-            self.agent_id = id.to_string();
+            // Do NOT claim success here: the panel's marker follows AgentReady,
+            // which only fires after a real handshake. This is just feedback that
+            // the click registered.
+            let label = agents::find(id).map(|k| k.label).unwrap_or(id);
+            self.rows.push(Row::Notice(format!("正在切换到 {label}…")));
+            self.phase = Phase::Restarting;
             self.send(UiCommand::SwitchAgent(id.to_string()));
         }
         if let Some(id) = install {
             self.send(UiCommand::InstallAdapter(id.to_string()));
+        }
+        if let Some(id) = install_cli {
+            self.send(UiCommand::InstallCli(id.to_string()));
         }
 
         ui.add_space(10.0);
