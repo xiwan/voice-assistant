@@ -491,6 +491,9 @@ fn run_with(cfg: &Config, ui: Ui, commands: Receiver<UiCommand>) -> Result<()> {
 
     ui.ready(&cfg.wake_display);
 
+    // Live-adjustable parameters, seeded from config and moved by the settings UI.
+    let mut tuning = Tuning::from(cfg);
+
     // `Conv` holds the conversation state (busy / follow-up window / the running
     // task / a paused-and-resumable task).
     let mut conv = Conv::default();
@@ -531,7 +534,7 @@ fn run_with(cfg: &Config, ui: Ui, commands: Receiver<UiCommand>) -> Result<()> {
             drain_while_speaking(&rx, &speaker)?;
             vad.reset();
             wake.reset();
-            match record_utterance(&rx, &mut vad, cfg)? {
+            match record_utterance(&rx, &mut vad, &tuning)? {
                 Some(audio) => handle_command(audio, &asr, &agent, &speaker, &ui, &mut conv),
                 None => {
                     let bye = "好的，我先下线待机了，需要时再叫我。";
@@ -564,6 +567,14 @@ fn run_with(cfg: &Config, ui: Ui, commands: Receiver<UiCommand>) -> Result<()> {
                         switch_agent(&id, &agent, &ui, cfg);
                         continue;
                     }
+                    Ok(UiCommand::Tune(change)) => {
+                        tune(&mut tuning, change, &ui);
+                        continue;
+                    }
+                    Ok(UiCommand::InstallAdapter(id)) => {
+                        install_adapter(&id, &ui);
+                        continue;
+                    }
                     Ok(cmd) => {
                         let (intent, text) = from_command(cmd);
                         act(intent, text, &agent, &speaker, &ui, &mut conv);
@@ -576,13 +587,13 @@ fn run_with(cfg: &Config, ui: Ui, commands: Receiver<UiCommand>) -> Result<()> {
             continue;
         };
         ui.wake_score(score);
-        if score < cfg.wake_threshold {
+        if score < tuning.wake_threshold {
             continue;
         }
         ui.wake(score, conv.busy);
         speaker.stop(); // stop talking the moment the user speaks up
         vad.reset();
-        match record_utterance(&rx, &mut vad, cfg)? {
+        match record_utterance(&rx, &mut vad, &tuning)? {
             Some(audio) => handle_command(audio, &asr, &agent, &speaker, &ui, &mut conv),
             None => ui.no_speech(),
         }
@@ -646,6 +657,40 @@ fn switch_agent(id: &str, agent: &AgentHandle, ui: &Ui, cfg: &Config) {
     }
 }
 
+/// Install an agent's ACP adapter globally.
+///
+/// This runs `npm install -g <package>`, i.e. it fetches and executes
+/// third-party code — so it only ever happens because the user asked for it, the
+/// exact command is reported before it runs, and the result (including npm's own
+/// error output) is reported back. It runs on its own thread: npm takes tens of
+/// seconds and the pipeline must keep listening.
+fn install_adapter(id: &str, ui: &Ui) {
+    let Some(kind) = agents::find(id) else {
+        ui.error(format!("未知 agent: {id}"));
+        return;
+    };
+    let Some(cmd) = agents::install_argv(kind) else {
+        ui.notice(format!("{} 无需适配器", kind.label));
+        return;
+    };
+    ui.notice(format!("正在安装: {}（可能要几十秒）", cmd.join(" ")));
+    let ui = ui.clone();
+    let label = kind.label.to_string();
+    std::thread::spawn(move || {
+        match std::process::Command::new(&cmd[0]).args(&cmd[1..]).output() {
+            Ok(out) if out.status.success() => {
+                ui.notice(format!("{label} 适配器安装完成，现在可以切换过去"))
+            }
+            Ok(out) => {
+                let err = String::from_utf8_lossy(&out.stderr);
+                let tail = err.lines().rev().take(2).collect::<Vec<_>>().join(" ");
+                ui.error(format!("安装失败: {}", ui::truncate(&tail)));
+            }
+            Err(e) => ui.error(format!("无法执行 npm: {e}")),
+        }
+    });
+}
+
 /// Transcribe an utterance and dispatch it. Everything after the transcript is
 /// shared with front-end commands via `act`, so a button and a spoken phrase
 /// take exactly the same path.
@@ -681,10 +726,11 @@ fn from_command(cmd: UiCommand) -> (Intent, String) {
         UiCommand::Pause => (Intent::Pause, String::new()),
         UiCommand::Resume => (Intent::Resume, String::new()),
         UiCommand::Abandon | UiCommand::Quit => (Intent::Abandon, String::new()),
-        // Reached only if a caller forgets to intercept it; abandoning is the
+        // Reached only if a caller forgets to intercept these; abandoning is the
         // conservative reading (do not leave a task running against an agent
-        // that is being replaced).
+        // that is being replaced, or through a settings change).
         UiCommand::SwitchAgent(_) => (Intent::Abandon, String::new()),
+        UiCommand::Tune(_) | UiCommand::InstallAdapter(_) => (Intent::Abandon, String::new()),
     }
 }
 
@@ -743,13 +789,67 @@ fn act(
     }
 }
 
+/// The slice of `Config` a front end may move while the pipeline runs.
+///
+/// These are re-read on every loop iteration, so changing them takes effect at
+/// once. Anything needing a model reload (wake word, whisper size, language) is
+/// deliberately absent: those go to the config file and wait for a restart.
+#[derive(Clone, Copy)]
+struct Tuning {
+    wake_threshold: f32,
+    silence_ms: f32,
+    no_speech_ms: f32,
+    max_utterance_ms: f32,
+}
+
+impl Tuning {
+    fn from(cfg: &Config) -> Self {
+        Tuning {
+            wake_threshold: cfg.wake_threshold,
+            silence_ms: cfg.silence_ms,
+            no_speech_ms: cfg.no_speech_ms,
+            max_utterance_ms: cfg.max_utterance_ms,
+        }
+    }
+}
+
+/// Apply one live parameter change, clamped to a range that cannot brick the
+/// pipeline (a 0 threshold would fire constantly; a 0 silence would cut every
+/// word), then persist it so a restart keeps the choice.
+fn tune(t: &mut Tuning, change: ui::Tunable, ui: &Ui) {
+    use ui::Tunable;
+    let what = match change {
+        Tunable::WakeThreshold(v) => {
+            t.wake_threshold = v.clamp(0.05, 0.95);
+            format!("唤醒阈值 = {:.2}", t.wake_threshold)
+        }
+        Tunable::SilenceMs(v) => {
+            t.silence_ms = v.clamp(200.0, 5000.0);
+            format!("停顿判定 = {:.0}ms", t.silence_ms)
+        }
+        Tunable::NoSpeechMs(v) => {
+            t.no_speech_ms = v.clamp(1000.0, 300_000.0);
+            format!("等待开口 = {:.0}ms", t.no_speech_ms)
+        }
+    };
+    ui.notice(what);
+    if let Some(mut s) = setup::load() {
+        s.threshold = t.wake_threshold;
+        s.silence_ms = t.silence_ms as u32;
+        s.no_speech_ms = t.no_speech_ms as u32;
+        if let Err(e) = setup::save(&s) {
+            ui.error(format!("已生效，但写入配置失败: {e}"));
+        }
+    }
+}
+
 /// Record until the speaker stops talking (VAD-based endpointing).
 /// Returns `None` if no speech started within `no_speech_ms` (the caller uses
 /// this to fall back to wake-word mode), otherwise the captured utterance.
 fn record_utterance(
     rx: &Receiver<Vec<i16>>,
     vad: &mut vad::Vad,
-    cfg: &Config,
+    t: &Tuning,
 ) -> Result<Option<Vec<i16>>> {
     const CHUNK_MS: f32 = VAD_CHUNK as f32 * 1000.0 / 16000.0; // 32 ms
     const STALL_MS: f32 = 500.0; // wait this long before assuming silence
@@ -787,13 +887,13 @@ fn record_utterance(
                 anyhow::bail!("audio capture stopped (input device gone?)")
             }
         }
-        if speech_started && silence_ms >= cfg.silence_ms {
+        if speech_started && silence_ms >= t.silence_ms {
             break; // said something, then went quiet -> done
         }
-        if !speech_started && total_ms >= cfg.no_speech_ms {
+        if !speech_started && total_ms >= t.no_speech_ms {
             break; // never spoke -> give up
         }
-        if total_ms >= cfg.max_utterance_ms {
+        if total_ms >= t.max_utterance_ms {
             break; // hard cap
         }
     }
@@ -927,7 +1027,8 @@ fn test_asr(cfg: &Config) -> Result<()> {
     let asr = cfg.asr()?;
     let (_cap, rx) = start_capture_unmuted()?;
     println!("speak now (recording until 1s of silence)...");
-    match record_utterance(&rx, &mut vad, cfg)? {
+    let tuning = Tuning::from(cfg);
+    match record_utterance(&rx, &mut vad, &tuning)? {
         Some(audio) => {
             println!("recorded {:.1}s, transcribing...", audio.len() as f32 / 16000.0);
             let text = asr.transcribe(&audio)?;

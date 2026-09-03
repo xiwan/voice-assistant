@@ -17,7 +17,8 @@
 //!   Tauri was rejected for this window (WebKitGTK bugs and no wlr-layer-shell on
 //!   GNOME/Wayland, as documented by SpeakoFlow); glow avoids that whole stack.
 
-use crate::ui::{ToolState, Ui, UiCommand, UiEvent};
+use crate::agents;
+use crate::ui::{ToolState, Tunable, Ui, UiCommand, UiEvent};
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use eframe::egui;
 use std::sync::{Arc, Mutex};
@@ -168,6 +169,16 @@ struct App {
     show_details: bool,
     thoughts: usize,
     tools: usize,
+    /// Settings panel state.
+    show_settings: bool,
+    /// Registry id of the agent believed to be running.
+    agent_id: String,
+    agent_cmd: String,
+    /// Availability of each agent, refreshed when the panel opens rather than
+    /// every frame (each check touches the filesystem).
+    agent_states: Vec<(&'static agents::Kind, agents::State)>,
+    silence_ms: f32,
+    no_speech_ms: f32,
 }
 
 impl App {
@@ -201,7 +212,19 @@ impl App {
             show_details: false,
             thoughts: 0,
             tools: 0,
+            show_settings: false,
+            agent_id: agents::id_of(&cfg.agent_cmd).unwrap_or("custom").to_string(),
+            agent_cmd: cfg.agent_cmd.join(" "),
+            agent_states: Vec::new(),
+            silence_ms: cfg.silence_ms,
+            no_speech_ms: cfg.no_speech_ms,
         }
+    }
+
+    /// Re-probe which agents are installed. Filesystem work, so it happens on
+    /// demand (opening the panel) instead of every frame.
+    fn refresh_agents(&mut self) {
+        self.agent_states = agents::KINDS.iter().map(|k| (k, agents::state(k))).collect();
     }
 
     fn send(&self, cmd: UiCommand) {
@@ -306,6 +329,15 @@ impl App {
             ui.separator();
             ui.weak(format!("“{}”", self.wake_word));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .selectable_label(self.show_settings, "⚙ 设置")
+                    .clicked()
+                {
+                    self.show_settings = !self.show_settings;
+                    if self.show_settings {
+                        self.refresh_agents();
+                    }
+                }
                 ui.checkbox(&mut self.show_details, "显示思考/工具");
                 if self.thoughts > 0 || self.tools > 0 {
                     ui.weak(format!("思考 {} · 工具 {}", self.thoughts, self.tools));
@@ -371,6 +403,93 @@ impl App {
         });
     }
 
+    /// Settings. Split in two on purpose: what can change now, and what is
+    /// written to the config file but only takes effect after a restart. Showing
+    /// a control that silently does nothing is worse than not showing it.
+    fn settings(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Agent");
+        ui.weak(format!("当前: {}", self.agent_cmd));
+        ui.add_space(4.0);
+        // Collected first so the immutable borrow of self.agent_states ends
+        // before any command mutates self.
+        let mut switch_to: Option<&'static str> = None;
+        let mut install: Option<&'static str> = None;
+        for (kind, state) in &self.agent_states {
+            ui.horizontal(|ui| {
+                let selected = self.agent_id == kind.id;
+                let color = if state.usable() {
+                    egui::Color32::from_rgb(70, 190, 120)
+                } else {
+                    egui::Color32::from_rgb(200, 150, 60)
+                };
+                ui.colored_label(color, if selected { "◉" } else { "○" });
+                ui.label(kind.label);
+                ui.weak(state.label());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    match state {
+                        // Usable: offer the switch (unless it is already running).
+                        s if s.usable() => {
+                            if ui
+                                .add_enabled(!selected, egui::Button::new("切换"))
+                                .clicked()
+                            {
+                                switch_to = Some(kind.id);
+                            }
+                            if *s == agents::State::ViaNpx && ui.button("装到本地").clicked() {
+                                install = Some(kind.id);
+                            }
+                        }
+                        // CLI present, adapter missing: we can fix that.
+                        agents::State::NeedsAdapter => {
+                            if ui.button("安装适配器").clicked() {
+                                install = Some(kind.id);
+                            }
+                        }
+                        // No CLI: only the user can install and log into it, so
+                        // show the command instead of pretending to help.
+                        agents::State::NeedsCli => {
+                            ui.weak(kind.install_cli);
+                        }
+                        _ => {}
+                    }
+                });
+            });
+        }
+        if let Some(id) = switch_to {
+            self.agent_id = id.to_string();
+            self.send(UiCommand::SwitchAgent(id.to_string()));
+        }
+        if let Some(id) = install {
+            self.send(UiCommand::InstallAdapter(id.to_string()));
+        }
+
+        ui.add_space(10.0);
+        ui.heading("即时生效");
+        if ui
+            .add(egui::Slider::new(&mut self.threshold, 0.05..=0.95).text("唤醒阈值"))
+            .drag_stopped()
+        {
+            self.send(UiCommand::Tune(Tunable::WakeThreshold(self.threshold)));
+        }
+        if ui
+            .add(egui::Slider::new(&mut self.silence_ms, 200.0..=3000.0).text("停顿判定 ms"))
+            .drag_stopped()
+        {
+            self.send(UiCommand::Tune(Tunable::SilenceMs(self.silence_ms)));
+        }
+        if ui
+            .add(egui::Slider::new(&mut self.no_speech_ms, 3000.0..=180_000.0).text("等待开口 ms"))
+            .drag_stopped()
+        {
+            self.send(UiCommand::Tune(Tunable::NoSpeechMs(self.no_speech_ms)));
+        }
+
+        ui.add_space(10.0);
+        ui.heading("需重启生效");
+        ui.weak("唤醒词 / 识别语言 / whisper 模型 / 语音引擎 —— 这些要重新加载模型，");
+        ui.weak("目前仍在 `voice-assistant setup` 里改，改完重启进程。");
+    }
+
     fn controls(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             // Same three intents speech has, so nothing can drift apart.
@@ -418,6 +537,14 @@ impl eframe::App for App {
             self.controls(ui);
             ui.add_space(6.0);
         });
+        if self.show_settings {
+            egui::Panel::right("settings").show(ui, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.set_min_width(320.0);
+                    self.settings(ui);
+                });
+            });
+        }
         egui::CentralPanel::default().show(ui, |ui| self.stream(ui));
     }
 }

@@ -103,8 +103,27 @@ pub enum UiCommand {
     /// gemini). Handled without restarting the process: the supervisor drops the
     /// current connection and opens one with the new command.
     SwitchAgent(String),
+    /// Change a runtime parameter that the pipeline can honour immediately.
+    /// Anything requiring a model reload (wake word, whisper size, language) is
+    /// deliberately not here — those are written to config and need a restart.
+    Tune(Tunable),
+    /// Install an agent's ACP adapter (`npm install -g …`). Separate from
+    /// switching because it runs third-party code and takes a while.
+    InstallAdapter(String),
     /// Shut the pipeline down.
     Quit,
+}
+
+/// Parameters the running pipeline re-reads on every loop, so a front end can
+/// move them without a restart.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Tunable {
+    /// Wake-word detection threshold (0–1).
+    WakeThreshold(f32),
+    /// Trailing silence that ends an utterance, ms.
+    SilenceMs(f32),
+    /// How long to wait for speech to start before giving up, ms.
+    NoSpeechMs(f32),
 }
 
 /// Handle the pipeline holds. Cloneable and `Send`, because the ACP supervisor
