@@ -81,13 +81,38 @@ voice-assistant gui
 - 对话流：你说的话、流式生成的回答；思考过程和工具调用默认折叠，勾选后展开
 - 暂停 / 继续 / 放弃三个按钮，和说"暂停/继续/算了"完全等价
 - 输入框：不方便说话时直接打字
-- ⚙ 设置面板：切换 agent（kiro-cli / Claude Code / Codex / DeepSeek Harness，自动探测本机是否
-  装了，缺 ACP 适配器可一键 `npm i -g` 装上）、拖动唤醒阈值和断句参数（即时生效并写回
-  配置）。切 agent **不重启进程**——supervisor 换个命令重连即可
+- ⚙ 设置面板：切 agent、装缺失的 CLI/适配器、拖参数、换监听方式、填模型 API key。
+  每个 agent 前面有个手绘小标记（kiro 是幽灵、dsh 是鲸鱼、Claude 是放射线、Codex 是六边形）——
+  不是厂商官方 logo：egui 自带字体没有这些 emoji 字形，而打包商标素材要引入图片解码器
 
 用 egui + glow（OpenGL）而不是 Tauri：不引入 WebView，三平台一份代码。egui 自带字体
 不含中文，程序会自动探测系统中文字体（macOS Hiragino/PingFang、Windows 微软雅黑、
 Linux Noto Sans CJK / 文泉驿）；都找不到时会提示，界面中文会显示为方块。
+
+### 怎么开始听：常听 or 按住说话
+
+默认是**常听**：唤醒词一直在监听。设置面板里可切成**按住说话**（push-to-talk），
+默认按 `Space`，可改键：
+
+- 按住期间录音，**松开即结束**——不跑 VAD 断句，你的手指就是断句点，
+  跑 VAD 会在你中途停顿时把话掐断。`max_utterance_ms` 仍然兜底防按键卡住，
+  短于 250ms 的当误触丢弃
+- 只在**窗口有焦点**时有效。全局热键（在别的 App 里也能按）需要新依赖和
+  macOS 辅助功能授权，还没做
+- 输入框获得键盘焦点时忽略该键，否则打字会一路发送出去
+
+配置项是 `listen_mode`（wake / ptt）和 `ptt_key`。
+
+### 模型 API key
+
+kiro-cli / Claude Code / Codex 都用各自 CLI 的登录态，本程序不碰凭据。
+DeepSeek Harness 需要 API key，在设置面板「模型凭据」里填。存放规则：
+
+- 存在 **`~/.voice-assistant/secrets`**（权限 `0600`），**不在** `config` 里——
+  这样你把配置贴进 issue 不会连带泄露；也不在仓库里，提交不进去
+- 以**子进程环境变量**交给 agent，不进命令行参数，所以不会出现在日志、
+  报错信息或 `ps` 输出里；只传当前 agent 声明的那一个变量
+- 面板只显示掩码（`sk-…218（35 位）`），密码框不回填明文
 
 ### 打断与继续
 
@@ -221,6 +246,8 @@ setup 重设或每次启动都会按当前唤醒词/权限重写，请勿手改�
   打印当前引擎和平台默认值（Linux 需先装 `espeak-ng`，或用 `tts=cmd` 接 piper/kokoro）
 - **助手把自己的话当指令**：麦克风现在全程实时监听（为支持朗读中打断），只对唤醒词响应；
   外放且无 AEC 时若被自身声音误触，戴耳机可根治，或临时把 `tts` 调低音量/关掉
+- **agent 起不来 / 后端报错看不到**：完整 stderr 在 `~/.voice-assistant/agent.log`，
+  界面上只显示第一条有用的行。连续失败三次会自动改用别的可用 agent 并说明原因
 - **agent 响应慢**：默认走 `kiro-cli acp --agent voice`（ACP 常驻进程，无 MCP 冷启动、多轮不重启）；`setup` 会自动配置
 - **模型下载慢/失败**：`VA_HF_BASE` 换源，或手动下载放入模型目录
 
