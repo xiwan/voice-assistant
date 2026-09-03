@@ -294,6 +294,7 @@ fn ask_cli(cfg: &Config) -> Result<()> {
         cfg.auto_approve,
         speaker.clone(),
         Ui::terminal(&cfg.persona),
+        agent_env(&cfg.agent_cmd),
     );
     for (i, p) in prompts.iter().enumerate() {
         println!("\n>> [{}] {p}", i + 1);
@@ -321,6 +322,7 @@ fn agent_test(cfg: &Config) -> Result<()> {
         cfg.auto_approve,
         silent,
         Ui::terminal(&cfg.persona),
+        agent_env(&cfg.agent_cmd),
     );
 
     // Consume states until the next Idle, printing each transition. Returns the
@@ -371,7 +373,13 @@ fn events_cli(cfg: &Config) -> Result<()> {
     eprintln!("[acp] starting agent: {}", cfg.agent_cmd.join(" "));
     let (ui, events) = Ui::channel();
     let silent = tts::Tts::spawn(tts::Engine::Off, Arc::new(AtomicBool::new(false)));
-    let agent = AgentHandle::spawn(cfg.agent_cmd.clone(), cfg.auto_approve, silent, ui.clone());
+    let agent = AgentHandle::spawn(
+        cfg.agent_cmd.clone(),
+        cfg.auto_approve,
+        silent,
+        ui.clone(),
+        agent_env(&cfg.agent_cmd),
+    );
 
     // A front end also sees what the state machine reports, not just the agent.
     ui.ready(&cfg.wake_display);
@@ -446,14 +454,20 @@ fn agents_cli(cfg: &Config) -> Result<()> {
     let ui = Ui::terminal(&cfg.persona);
     let silent = tts::Tts::spawn(tts::Engine::Off, Arc::new(AtomicBool::new(false)));
     eprintln!("\n[1] 当前 agent: {}", cfg.agent_cmd.join(" "));
-    let agent = AgentHandle::spawn(cfg.agent_cmd.clone(), cfg.auto_approve, silent, ui.clone());
+    let agent = AgentHandle::spawn(
+        cfg.agent_cmd.clone(),
+        cfg.auto_approve,
+        silent,
+        ui.clone(),
+        agent_env(&cfg.agent_cmd),
+    );
     let q = "你是什么模型？只回答模型或产品名，一行以内。";
     agent.prompt(q.into());
     wait_for_idle(&agent);
 
     let argv = agents::argv(kind, &cfg.agent_mode);
     eprintln!("\n[2] 热切换到 {}: {}", kind.label, argv.join(" "));
-    agent.switch(argv);
+    agent.switch(argv.clone(), agent_env(&argv));
     agent.prompt(q.into());
     wait_for_idle(&agent);
     agent.shutdown();
@@ -494,12 +508,8 @@ fn run_with(cfg: &Config, ui: Ui, commands: Receiver<UiCommand>) -> Result<()> {
     // left alone, because the user's choice is not ours to overwrite.
     let launch = fallback_if_unusable(cfg, &ui);
     eprintln!("[acp] starting agent: {}", launch.join(" "));
-    let agent = AgentHandle::spawn(
-        launch,
-        cfg.auto_approve,
-        speaker.clone(),
-        ui.clone(),
-    );
+    let env = agent_env(&launch);
+    let agent = AgentHandle::spawn(launch, cfg.auto_approve, speaker.clone(), ui.clone(), env);
 
     ui.ready(&cfg.wake_display);
 
@@ -547,7 +557,7 @@ fn run_with(cfg: &Config, ui: Ui, commands: Receiver<UiCommand>) -> Result<()> {
                     match usable_alternative(cfg) {
                         Some((alt, argv)) => {
                             ui.notice(format!("改用 {}", alt.label));
-                            agent.switch(argv);
+                            agent.switch(argv.clone(), agent_env(&argv));
                         }
                         None => ui.error("没有可用的 agent，界面仍可用但没法执行任务"),
                     }
@@ -689,6 +699,24 @@ struct Conv {
 ///
 /// Only registry agents can be judged: a custom command is launched as written,
 /// since we know nothing about it.
+/// Credentials to hand the agent process, taken from ~/.voice-assistant/secrets.
+///
+/// Only the variable the *selected* agent declares is passed, so a key for one
+/// backend is never visible to another. Nothing here is logged or shown.
+fn agent_env(argv: &[String]) -> Vec<(String, String)> {
+    let Some(var) = agents::id_of(argv)
+        .and_then(agents::find)
+        .and_then(|k| k.api_key_env)
+    else {
+        return Vec::new();
+    };
+    setup::load_secrets()
+        .into_iter()
+        .find(|(k, _)| k == var)
+        .map(|(k, v)| vec![(k, v)])
+        .unwrap_or_default()
+}
+
 /// The first registry agent that can actually start, other than the one
 /// configured. Used both at startup and after the supervisor gives up.
 fn usable_alternative(cfg: &Config) -> Option<(&'static agents::Kind, Vec<String>)> {
@@ -744,7 +772,7 @@ fn switch_agent(id: &str, agent: &AgentHandle, ui: &Ui, cfg: &Config) {
     }
     let argv = agents::argv(kind, &cfg.agent_mode);
     ui.notice(format!("切换到 {}：{}", kind.label, argv.join(" ")));
-    agent.switch(argv.clone());
+    agent.switch(argv.clone(), agent_env(&argv));
     if let Some(mut s) = setup::load() {
         s.agent_cmd = argv.join(" ");
         if let Err(e) = setup::save(&s) {

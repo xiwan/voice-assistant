@@ -187,6 +187,11 @@ struct App {
     rebinding: bool,
     /// Last key state sent, so `Talk` is emitted on edges only.
     talk_down: bool,
+    /// Which secrets exist, for the mask. Values are held only to mask them and
+    /// are never rendered in full or logged.
+    secrets: Vec<(String, String)>,
+    /// In-progress entry per variable, kept out of `secrets` until saved.
+    key_input: std::collections::HashMap<String, String>,
 }
 
 impl App {
@@ -230,6 +235,8 @@ impl App {
             ptt_key: egui::Key::from_name(&cfg.ptt_key).unwrap_or(egui::Key::Space),
             rebinding: false,
             talk_down: false,
+            secrets: crate::setup::load_secrets(),
+            key_input: std::collections::HashMap::new(),
         };
         app.refresh_agents();
         app
@@ -618,6 +625,60 @@ impl App {
             });
             ui.weak("按住说、松开结束。只在这个窗口有焦点时生效——");
             ui.weak("全局热键需要额外依赖和系统辅助功能授权，还没做。");
+        }
+
+        ui.add_space(10.0);
+        ui.heading("模型凭据");
+        // Only agents that read a key from the environment appear here; the rest
+        // authenticate through their own CLI login and there is nothing to hold.
+        let mut saved: Option<(&'static str, String)> = None;
+        for kind in agents::KINDS.iter().filter(|k| k.api_key_env.is_some()) {
+            let var = kind.api_key_env.unwrap();
+            ui.horizontal(|ui| {
+                ui.label(kind.label);
+                match self.secrets.iter().find(|(k, _)| k == var) {
+                    // Never re-display the value, not even in a password field:
+                    // a mask is enough to recognise it, and useless if seen.
+                    Some((_, v)) => {
+                        ui.weak(crate::setup::mask(v));
+                        if ui.button("清除").clicked() {
+                            saved = Some((var, String::new()));
+                        }
+                    }
+                    None => {
+                        ui.colored_label(egui::Color32::from_rgb(200, 150, 60), "未设置");
+                    }
+                }
+            });
+            ui.horizontal(|ui| {
+                let entry = self.key_input.entry(var.to_string()).or_default();
+                ui.add(
+                    egui::TextEdit::singleline(entry)
+                        .password(true)
+                        .hint_text(var)
+                        .desired_width(200.0),
+                );
+                if ui.button("保存").clicked() && !entry.trim().is_empty() {
+                    saved = Some((var, std::mem::take(entry)));
+                }
+            });
+        }
+        if let Some((var, value)) = saved {
+            let cleared = value.trim().is_empty();
+            match crate::setup::save_secret(var, &value) {
+                Ok(()) => {
+                    self.secrets = crate::setup::load_secrets();
+                    self.rows.push(Row::Notice(
+                        if cleared {
+                            format!("{var} 已清除")
+                        } else {
+                            // The value itself is deliberately absent from this line.
+                            format!("{var} 已保存（重连 agent 后生效）")
+                        },
+                    ));
+                }
+                Err(e) => self.rows.push(Row::Error(format!("写入失败: {e}"))),
+            }
         }
 
         ui.add_space(10.0);

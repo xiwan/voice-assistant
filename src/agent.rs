@@ -36,7 +36,7 @@ pub enum AgentCmd {
     /// The supervisor already kills and respawns connections to recover from
     /// crashes, so switching backends is that same path with a new argv — the
     /// "exactly one agent" invariant is unchanged.
-    Switch(Vec<String>),
+    Switch(Vec<String>, Vec<(String, String)>),
     Shutdown,
 }
 
@@ -70,10 +70,16 @@ impl AgentHandle {
     /// streams; it survives agent restarts because the handle is cloneable.
     /// `ui` is likewise handed down, so progress reaches whatever front end is
     /// attached (terminal or window) instead of being printed here.
-    pub fn spawn(cmd: Vec<String>, auto_approve: bool, tts: Tts, ui: Ui) -> Self {
+    pub fn spawn(
+        cmd: Vec<String>,
+        auto_approve: bool,
+        tts: Tts,
+        ui: Ui,
+        env: Vec<(String, String)>,
+    ) -> Self {
         let (cmd_tx, cmd_rx) = unbounded::<AgentCmd>();
         let (state_tx, state_rx) = unbounded::<AgentState>();
-        thread::spawn(move || supervisor(cmd, auto_approve, tts, ui, cmd_rx, state_tx));
+        thread::spawn(move || supervisor(cmd, auto_approve, tts, ui, env, cmd_rx, state_tx));
         AgentHandle { cmd_tx, state_rx }
     }
 
@@ -85,8 +91,10 @@ impl AgentHandle {
     }
     /// Swap in a different agent. Takes effect on the next connection, which the
     /// supervisor opens immediately.
-    pub fn switch(&self, argv: Vec<String>) {
-        let _ = self.cmd_tx.send(AgentCmd::Switch(argv));
+    /// `env` is the new agent's credentials: a switch changes backends, so the
+    /// old one's variables must not be carried over.
+    pub fn switch(&self, argv: Vec<String>, env: Vec<(String, String)>) {
+        let _ = self.cmd_tx.send(AgentCmd::Switch(argv, env));
     }
     pub fn shutdown(&self) {
         let _ = self.cmd_tx.send(AgentCmd::Shutdown);
@@ -97,7 +105,7 @@ impl AgentHandle {
 /// it with a different agent, or stop.
 enum Exit {
     Reconnect,
-    Switch(Vec<String>),
+    Switch(Vec<String>, Vec<(String, String)>),
     Shutdown,
 }
 
@@ -106,16 +114,18 @@ fn supervisor(
     auto_approve: bool,
     tts: Tts,
     ui: Ui,
+    env: Vec<(String, String)>,
     cmd_rx: Receiver<AgentCmd>,
     state_tx: Sender<AgentState>,
 ) {
     let mut cmd = cmd; // replaced in place by AgentCmd::Switch
+    let mut env = env;
     let mut backoff = BACKOFF_START;
     /// Give up after this many launches that never reached a handshake.
     const MAX_LAUNCH_FAILS: u32 = 3;
     let mut fails = 0u32;
     loop {
-        match AcpConnection::connect(&cmd, auto_approve, tts.clone(), ui.clone()) {
+        match AcpConnection::connect(&cmd, auto_approve, tts.clone(), ui.clone(), &env) {
             Ok((mut conn, incoming)) => {
                 backoff = BACKOFF_START; // healthy connection resets backoff
                 fails = 0;
@@ -131,9 +141,10 @@ fn supervisor(
                     }
                     // A switch is a deliberate replacement, so it skips the
                     // backoff a crash would earn and connects straight away.
-                    Exit::Switch(next) => {
+                    Exit::Switch(next, next_env) => {
                         drop(conn); // kill + reap before replacing (invariant)
                         cmd = next;
+                        env = next_env;
                         let _ = state_tx.send(AgentState::Restarting(format!(
                             "切换 agent: {}",
                             cmd.join(" ")
@@ -145,8 +156,9 @@ fn supervisor(
                         let _ = state_tx.send(AgentState::Restarting("agent 连接断开，重连中".into()));
                         match wait_or_shutdown(&cmd_rx, backoff) {
                             Downtime::Shutdown => return,
-                            Downtime::Switch(next) => {
+                            Downtime::Switch(next, next_env) => {
                                 cmd = next;
+                                env = next_env;
                                 backoff = BACKOFF_START;
                             }
                             Downtime::Elapsed => backoff = (backoff * 2).min(BACKOFF_MAX),
@@ -163,8 +175,9 @@ fn supervisor(
                     loop {
                         match wait_or_shutdown(&cmd_rx, Duration::from_secs(3600)) {
                             Downtime::Shutdown => return,
-                            Downtime::Switch(next) => {
+                            Downtime::Switch(next, next_env) => {
                                 cmd = next;
+                                env = next_env;
                                 fails = 0;
                                 backoff = BACKOFF_START;
                                 break;
@@ -177,8 +190,9 @@ fn supervisor(
                 let _ = state_tx.send(AgentState::Restarting(format!("启动失败: {e}")));
                 match wait_or_shutdown(&cmd_rx, backoff) {
                     Downtime::Shutdown => return,
-                    Downtime::Switch(next) => {
+                    Downtime::Switch(next, next_env) => {
                         cmd = next;
+                        env = next_env;
                         fails = 0;
                         backoff = BACKOFF_START;
                     }
@@ -203,11 +217,11 @@ fn run_connection(
                 Ok(AgentCmd::Shutdown) => return Exit::Shutdown,
                 // Stop the running turn before walking away from this agent, so
                 // it isn't killed mid-tool-call if a soft cancel would do.
-                Ok(AgentCmd::Switch(next)) => {
+                Ok(AgentCmd::Switch(next, env)) => {
                     if conn.is_busy() {
                         let _ = conn.cancel_and_wait(incoming, CANCEL_GRACE);
                     }
-                    return Exit::Switch(next);
+                    return Exit::Switch(next, env);
                 }
                 Ok(AgentCmd::Cancel) => {
                     if conn.is_busy() {
@@ -247,14 +261,14 @@ fn run_connection(
 /// worst moment.
 enum Downtime {
     Elapsed,
-    Switch(Vec<String>),
+    Switch(Vec<String>, Vec<(String, String)>),
     Shutdown,
 }
 
 fn wait_or_shutdown(cmd_rx: &Receiver<AgentCmd>, dur: Duration) -> Downtime {
     match cmd_rx.recv_timeout(dur) {
         Ok(AgentCmd::Shutdown) => Downtime::Shutdown,
-        Ok(AgentCmd::Switch(next)) => Downtime::Switch(next),
+        Ok(AgentCmd::Switch(next, env)) => Downtime::Switch(next, env),
         Err(RecvTimeoutError::Disconnected) => Downtime::Shutdown, // handle dropped
         // Timeout, or a prompt/cancel we drop while there is no agent to take it.
         _ => Downtime::Elapsed,

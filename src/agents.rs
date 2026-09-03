@@ -38,6 +38,10 @@ pub struct Kind {
     /// `profile "acp" does not exist` until the bundle is added, so having the
     /// CLI on PATH is not enough to call the agent usable.
     pub profile: Option<Profile>,
+    /// Environment variable this agent reads its API key from, when it needs one.
+    /// The others authenticate through their own CLI login, so there is nothing
+    /// for this program to hold.
+    pub api_key_env: Option<&'static str>,
 }
 
 /// An ACP entry point that lives inside the agent's own CLI.
@@ -97,6 +101,7 @@ pub const KINDS: &[Kind] = &[
         adapter_pkg: None,
         install: Install::Manual("从 https://kiro.dev 下载安装，然后 kiro-cli login"),
         profile: None,
+        api_key_env: None,
     },
     Kind {
         id: "claude",
@@ -106,6 +111,7 @@ pub const KINDS: &[Kind] = &[
         adapter_pkg: Some("@agentclientprotocol/claude-agent-acp"),
         install: Install::Npm("@anthropic-ai/claude-code"),
         profile: None,
+        api_key_env: None,
     },
     Kind {
         id: "codex",
@@ -115,6 +121,7 @@ pub const KINDS: &[Kind] = &[
         adapter_pkg: Some("@agentclientprotocol/codex-acp"),
         install: Install::Npm("@openai/codex"),
         profile: None,
+        api_key_env: None,
     },
     Kind {
         id: "deepseek",
@@ -139,6 +146,9 @@ pub const KINDS: &[Kind] = &[
                 "@deepseek-ai/dsh-acp-app",
             ],
         }),
+        // dsh's own config tree declares `apiKeyEnv: DEEPSEEK_API_KEY`; without
+        // it the ACP handshake succeeds and then nothing ever answers.
+        api_key_env: Some("DEEPSEEK_API_KEY"),
     },
 ];
 

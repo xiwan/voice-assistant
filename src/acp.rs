@@ -66,15 +66,20 @@ impl AcpConnection {
     /// receiver the caller waits on. Keeping the receiver separate from the
     /// connection lets the supervisor `select!` on it while still holding
     /// `&mut AcpConnection` to handle each message.
+    /// `env` carries credentials the agent expects (e.g. `DEEPSEEK_API_KEY`).
+    /// They go into the child's environment, never into argv, so they cannot end
+    /// up in a log line, an error message or a `ps` listing.
     pub fn connect(
         cmd: &[String],
         auto_approve: bool,
         tts: Tts,
         ui: Ui,
+        env: &[(String, String)],
     ) -> Result<(Self, Receiver<Incoming>)> {
         anyhow::ensure!(!cmd.is_empty(), "agent command is empty");
         let mut child = Command::new(&cmd[0])
             .args(&cmd[1..])
+            .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             // Captured, not inherited: a crashing backend used to dump dozens of

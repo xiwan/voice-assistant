@@ -132,6 +132,65 @@ fn home_from(get: impl Fn(&str) -> Option<String>) -> PathBuf {
     }
 }
 
+/// Secrets live in their own file, never in `config`.
+///
+/// Reasons, in order of importance: the file is `0600` so other users on the
+/// machine cannot read it; keeping it separate means the config can be pasted
+/// into a bug report without leaking a key; and nothing here is ever echoed back
+/// to a UI or a log — the settings panel shows a mask, and launch messages print
+/// argv, never the environment.
+///
+/// Format is the same trivial `KEY=value` as config, one per line. This is not
+/// encryption: a local file readable by the user is the same trust level as the
+/// agent CLIs' own credential files (`~/.dsh`, `~/.codex`), which is the bar to
+/// meet, not exceed.
+fn secrets_path() -> PathBuf {
+    base_dir().join("secrets")
+}
+
+pub fn load_secrets() -> Vec<(String, String)> {
+    let Ok(text) = fs::read_to_string(secrets_path()) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|l| l.split_once('='))
+        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+        .filter(|(k, v)| !k.is_empty() && !v.is_empty())
+        .collect()
+}
+
+/// Set or replace one secret. An empty value removes it.
+pub fn save_secret(name: &str, value: &str) -> Result<()> {
+    let mut kept: Vec<(String, String)> = load_secrets()
+        .into_iter()
+        .filter(|(k, _)| k != name)
+        .collect();
+    if !value.trim().is_empty() {
+        kept.push((name.to_string(), value.trim().to_string()));
+    }
+    fs::create_dir_all(base_dir())?;
+    let body: String = kept.iter().map(|(k, v)| format!("{k}={v}\n")).collect();
+    let path = secrets_path();
+    fs::write(&path, body)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+/// Enough of a secret to recognise it, never enough to use it.
+pub fn mask(value: &str) -> String {
+    let n = value.chars().count();
+    if n <= 8 {
+        return "•".repeat(n.max(1));
+    }
+    let head: String = value.chars().take(3).collect();
+    let tail: String = value.chars().skip(n - 3).collect();
+    format!("{head}…{tail}（{n} 位）")
+}
+
 pub fn base_dir() -> PathBuf {
     home().join(".voice-assistant")
 }
