@@ -43,6 +43,9 @@ pub enum AgentCmd {
     /// Deliberately abandon the conversation and start a clean session. Every
     /// other path tries to preserve context, so forgetting has to be asked for.
     NewSession,
+    /// Pick a value for an agent-advertised option (model / reasoning effort),
+    /// applied over ACP on the live connection — no restart.
+    SetConfig(String, String),
     Shutdown,
 }
 
@@ -106,6 +109,10 @@ impl AgentHandle {
     pub fn new_session(&self) {
         let _ = self.cmd_tx.send(AgentCmd::NewSession);
     }
+    /// Pick a value for an agent-advertised option (model / reasoning effort).
+    pub fn set_config(&self, option_id: String, value: String) {
+        let _ = self.cmd_tx.send(AgentCmd::SetConfig(option_id, value));
+    }
     /// Swap in a different agent. Takes effect on the next connection, which the
     /// supervisor opens immediately.
     /// `env` is the new agent's credentials: a switch changes backends, so the
@@ -166,6 +173,8 @@ fn supervisor(
                 // not evidence that the switch happened, and a front end has no
                 // other way to know which agent it is now talking to.
                 ui.agent_ready(&cmd.join(" "));
+                // And what that agent lets you choose (model / reasoning effort).
+                conn.report_config_options();
                 match run_connection(&mut conn, &incoming, &cmd_rx, &state_tx, &store, &cmd) {
                     Exit::Shutdown => {
                         drop(conn); // graceful close + reap
@@ -282,6 +291,15 @@ fn run_connection(
                         s.save();
                     }
                     return Exit::Fresh;
+                }
+                // Model / reasoning-effort change: applied on the live connection
+                // over ACP, so it needs no restart and keeps the conversation.
+                Ok(AgentCmd::SetConfig(option_id, value)) => {
+                    if let Err(e) = conn.set_config(incoming, &option_id, &value) {
+                        state_tx
+                            .send(AgentState::Restarting(format!("设置 {option_id} 失败: {e}")))
+                            .ok();
+                    }
                 }
                 Ok(AgentCmd::Cancel) => {
                     if conn.is_busy() {

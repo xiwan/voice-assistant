@@ -25,8 +25,8 @@ mod agent;
 mod agents;
 mod asr;
 mod audio;
+mod config_option;
 mod gui;
-mod models;
 mod session;
 mod setup;
 mod tts;
@@ -62,8 +62,6 @@ struct Config {
     auto_approve: Arc<AtomicBool>,
     /// kiro-cli permission mode (readonly/safe/full); used to refresh voice.json.
     agent_mode: String,
-    /// Model id for backends that accept one at launch; empty = their default.
-    model: String,
     /// Assistant persona name derived from the wake word (e.g. "Jarvis").
     persona: String,
     /// Spoken-output engine (off / say).
@@ -131,7 +129,6 @@ impl Config {
                 .collect(),
             auto_approve: Arc::new(AtomicBool::new(settings.agent_mode == "full")),
             agent_mode: settings.agent_mode.clone(),
-            model: env("VA_MODEL", &settings.model),
             persona: setup::persona_name(&settings.wake_word),
             tts_engine: tts::Engine::resolve(
                 &env("VA_TTS", &settings.tts),
@@ -499,7 +496,7 @@ fn agents_cli(cfg: &Config) -> Result<()> {
     for k in agents::KINDS {
         let st = agents::state(k);
         println!("[{}] {} — {}", if st.usable() { "ok" } else { "!!" }, k.label, st.label());
-        println!("    启动: {}", launch_argv(k, &cfg.agent_mode, &cfg.model).join(" "));
+        println!("    启动: {}", agents::argv(k, &cfg.agent_mode).join(" "));
         match st {
             agents::State::NeedsCli => println!("    安装 CLI: {}", k.install.hint()),
             agents::State::NeedsAdapter | agents::State::ViaNpx => {
@@ -548,7 +545,7 @@ fn agents_cli(cfg: &Config) -> Result<()> {
     agent.prompt(q.into());
     wait_for_idle(&agent);
 
-    let argv = launch_argv(kind, &cfg.agent_mode, &cfg.model);
+    let argv = agents::argv(kind, &cfg.agent_mode);
     eprintln!("\n[2] 热切换到 {}: {}", kind.label, argv.join(" "));
     agent.switch(argv.clone(), agent_env(&argv));
     agent.prompt(q.into());
@@ -725,6 +722,12 @@ fn run_with(cfg: &Config, ui: Ui, commands: Receiver<UiCommand>) -> Result<()> {
                         switch_agent(&id, &agent, &ui, cfg);
                         continue;
                     }
+                    // Model / reasoning-effort pick from the panel: straight through
+                    // to the supervisor, which applies it on the live connection.
+                    Ok(UiCommand::SetConfig { option_id, value }) => {
+                        agent.set_config(option_id, value);
+                        continue;
+                    }
                     Ok(UiCommand::ApplyAgentPrompt(text)) => {
                         apply_agent_prompt(&text, &tuning, cfg, &agent, &ui);
                         continue;
@@ -732,23 +735,9 @@ fn run_with(cfg: &Config, ui: Ui, commands: Receiver<UiCommand>) -> Result<()> {
                     Ok(UiCommand::Tune(change)) => {
                         let was_mode = tuning.agent_mode.clone();
                         let was_ptt = tuning.push_to_talk;
-                        let relaunch = tune(&mut tuning, change, &ui, &speaker);
+                        tune(&mut tuning, change, &ui, &speaker);
                         if tuning.agent_mode != was_mode {
                             apply_agent_mode(&tuning, cfg, &agent, &ui);
-                        } else if relaunch {
-                            // The model is a launch flag: the only way to apply it
-                            // is a relaunch of the same backend. Same argv means the
-                            // supervisor waits for a clean exit, so the session is
-                            // reloaded and the conversation survives the change.
-                            if let Some(kind) =
-                                agents::id_of(&cfg.agent_cmd).and_then(agents::find)
-                            {
-                                let argv = launch_argv(kind, &tuning.agent_mode, &tuning.model);
-                                ui.notice("重启 agent 以应用模型…");
-                                agent.switch(argv.clone(), agent_env(&argv));
-                            } else {
-                                ui.error("当前是自定义 agent 命令，模型请直接写在命令里");
-                            }
                         }
                         // Switching listening mode: the streaming wake detector
                         // requires a gap-free stream, and in push-to-talk mode the
@@ -871,16 +860,6 @@ struct Conv {
     resumable: Option<String>,
 }
 
-/// The full launch argv: what the registry says about the backend, plus the model
-/// choice for the backends that take one. Kept in one place so a model set in the
-/// panel cannot be forgotten by one of the several paths that start an agent
-/// (startup, fallback, switch, permission-mode relaunch).
-fn launch_argv(kind: &'static agents::Kind, mode: &str, model: &str) -> Vec<String> {
-    let mut argv = agents::argv(kind, mode);
-    models::apply(&mut argv, kind.id, model);
-    argv
-}
-
 /// Return the agent command to launch, substituting a working agent when the
 /// configured one is known to be unusable.
 ///
@@ -903,7 +882,7 @@ fn apply_agent_mode(t: &Tuning, cfg: &Config, agent: &AgentHandle, ui: &Ui) {
     // Rebuild argv for whichever agent is configured; only kiro varies by mode,
     // but relaunching is harmless for the others and keeps one code path.
     if let Some(kind) = agents::id_of(&cfg.agent_cmd).and_then(agents::find) {
-        let argv = launch_argv(kind, &t.agent_mode, &t.model);
+        let argv = agents::argv(kind, &t.agent_mode);
         agent.switch(argv.clone(), agent_env(&argv));
     }
     if t.agent_mode == "full" {
@@ -935,7 +914,7 @@ fn apply_agent_prompt(text: &str, t: &Tuning, cfg: &Config, agent: &AgentHandle,
             return;
         }
         if let Some(kind) = agents::id_of(&cfg.agent_cmd).and_then(agents::find) {
-            let argv = launch_argv(kind, &t.agent_mode, &t.model);
+            let argv = agents::argv(kind, &t.agent_mode);
             agent.switch(argv.clone(), agent_env(&argv));
             ui.notice("身份提示词已更新，agent 已重连");
         }
@@ -969,7 +948,7 @@ fn usable_alternative(cfg: &Config) -> Option<(&'static agents::Kind, Vec<String
     agents::KINDS
         .iter()
         .find(|k| Some(k.id) != current && agents::state(k).usable())
-        .map(|k| (k, launch_argv(k, &cfg.agent_mode, &cfg.model)))
+        .map(|k| (k, agents::argv(k, &cfg.agent_mode)))
 }
 
 fn fallback_if_unusable(cfg: &Config, ui: &Ui) -> Vec<String> {
@@ -1015,7 +994,7 @@ fn switch_agent(id: &str, agent: &AgentHandle, ui: &Ui, cfg: &Config) {
         ui.error(format!("{} 现在不可用（{}）", kind.label, state.label()));
         return;
     }
-    let argv = launch_argv(kind, &cfg.agent_mode, &cfg.model);
+    let argv = agents::argv(kind, &cfg.agent_mode);
     ui.notice(format!("切换到 {}：{}", kind.label, argv.join(" ")));
     agent.switch(argv.clone(), agent_env(&argv));
     if let Some(mut s) = setup::load() {
@@ -1121,6 +1100,7 @@ fn from_command(cmd: UiCommand) -> (Intent, String) {
         | UiCommand::InstallAdapter(_)
         | UiCommand::InstallCli(_)
         | UiCommand::TtsPreview
+        | UiCommand::SetConfig { .. }
         | UiCommand::Talk(_) => {
             (Intent::Abandon, String::new())
         }
@@ -1325,8 +1305,6 @@ fn session_test(cfg: &Config) -> Result<()> {
 struct Tuning {
     /// kiro-cli permission mode; also decides tool auto-approval.
     agent_mode: String,
-    /// Model the agent is launched with (empty = backend default).
-    model: String,
     /// True = hold a key to talk; false = always listening for the wake word.
     push_to_talk: bool,
     wake_threshold: f32,
@@ -1348,7 +1326,6 @@ impl Tuning {
     fn from(cfg: &Config) -> Self {
         Tuning {
             agent_mode: cfg.agent_mode.clone(),
-            model: cfg.model.clone(),
             push_to_talk: cfg.push_to_talk,
             wake_threshold: cfg.wake_threshold,
             silence_ms: cfg.silence_ms,
@@ -1371,13 +1348,10 @@ impl Tuning {
 /// Apply one live parameter change, clamped to a range that cannot brick the
 /// pipeline (a 0 threshold would fire constantly; a 0 silence would cut every
 /// word), then persist it so a restart keeps the choice.
-fn tune(t: &mut Tuning, change: ui::Tunable, ui: &Ui, speaker: &tts::Tts) -> bool {
+fn tune(t: &mut Tuning, change: ui::Tunable, ui: &Ui, speaker: &tts::Tts) {
     use ui::Tunable;
     // Whether this change alters what the player should be using.
     let mut tts_changed = false;
-    // Whether the agent has to be relaunched to take effect (the model is a launch
-    // flag, so there is no way to change it in place).
-    let mut model_changed = false;
     let what = match change {
         Tunable::WakeThreshold(v) => {
             t.wake_threshold = v.clamp(0.05, 0.95);
@@ -1401,15 +1375,6 @@ fn tune(t: &mut Tuning, change: ui::Tunable, ui: &Ui, speaker: &tts::Tts) -> boo
                 "已切到按键说话（按住说，松开结束）".to_string()
             } else {
                 "已切回常听模式（说唤醒词开始）".to_string()
-            }
-        }
-        Tunable::Model(id) => {
-            t.model = id;
-            model_changed = true;
-            if t.model.is_empty() {
-                "模型 = 后端默认".to_string()
-            } else {
-                format!("模型 = {}", t.model)
             }
         }
         Tunable::TtsEngine(id) => {
@@ -1460,7 +1425,6 @@ fn tune(t: &mut Tuning, change: ui::Tunable, ui: &Ui, speaker: &tts::Tts) -> boo
         s.no_speech_ms = t.no_speech_ms as u32;
         s.listen_mode = if t.push_to_talk { "ptt".into() } else { "wake".into() };
         s.agent_mode = t.agent_mode.clone();
-        s.model = t.model.clone();
         s.tts = t.tts_id.clone();
         s.tts_voice = t.tts_voice.clone();
         s.tts_rate = t.tts_rate;
@@ -1469,7 +1433,6 @@ fn tune(t: &mut Tuning, change: ui::Tunable, ui: &Ui, speaker: &tts::Tts) -> boo
             ui.error(format!("已生效，但写入配置失败: {e}"));
         }
     }
-    model_changed
 }
 
 /// Record for exactly as long as the talk key is held.
@@ -1846,7 +1809,6 @@ mod tests {
     fn test_tuning() -> Tuning {
         Tuning {
             agent_mode: "readonly".into(),
-            model: String::new(),
             push_to_talk: true,
             wake_threshold: 0.5,
             silence_ms: 1000.0,

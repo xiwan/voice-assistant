@@ -18,7 +18,6 @@
 //!   GNOME/Wayland, as documented by SpeakoFlow); glow avoids that whole stack.
 
 use crate::agents;
-use crate::models;
 use crate::ui::{ToolState, Tunable, Ui, UiCommand, UiEvent};
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use eframe::egui;
@@ -220,11 +219,11 @@ struct App {
     /// Settings panel state.
     show_settings: bool,
     settings_tab: Tab,
-    /// Models the current backend offers, probed when the panel opens (it shells
-    /// out). Empty means either "this backend has no choice" or "could not ask".
-    model_list: Vec<models::Model>,
-    /// Model id currently selected; empty = the backend's own default.
-    model: String,
+    /// Model / reasoning-effort options the connected agent advertised over ACP.
+    /// Data-driven: the panel renders one dropdown per entry, so a backend that
+    /// offers a reasoning-effort selector (dsh) gets one and a backend that does
+    /// not (kiro) simply does not.
+    config_options: Vec<crate::config_option::ConfigOption>,
     /// Registry id of the agent believed to be running.
     agent_id: String,
     agent_cmd: String,
@@ -320,8 +319,7 @@ impl App {
             tools: 0,
             show_settings: false,
             settings_tab: Tab::Agent,
-            model_list: Vec::new(),
-            model: cfg.model.clone(),
+            config_options: Vec::new(),
             agent_id: agents::id_of(&cfg.agent_cmd).unwrap_or("custom").to_string(),
             switching_to: None,
             agent_stage: None,
@@ -370,11 +368,6 @@ impl App {
         self.voices = list_voices();
     }
 
-    /// Ask the running backend what models it offers. Same rule as the voice list:
-    /// on demand, never per frame.
-    fn refresh_models(&mut self) {
-        self.model_list = models::list(&self.agent_id);
-    }
 
     /// Watch the talk key and report only its *edges*, so the pipeline gets one
     /// press and one release rather than a command per frame.
@@ -462,9 +455,6 @@ impl App {
                 self.agent_stage = None;
                 if self.show_settings {
                     self.refresh_agents();
-                    // Models are backend-specific: the list that was on screen
-                    // belonged to the previous agent.
-                    self.refresh_models();
                 }
             }
             UiEvent::WakeScore(s) => self.wake_score = s,
@@ -557,6 +547,9 @@ impl App {
                     )),
                 }
             }
+            UiEvent::ConfigOptions(opts) => {
+                self.config_options = opts;
+            }
             // Speaking outranks Thinking in the light because it is the state the
             // user can hear; when it ends, fall back to whatever the turn is doing.
             UiEvent::Speaking(on) => {
@@ -614,7 +607,6 @@ impl App {
                     if self.show_settings {
                         self.refresh_agents();
                         self.refresh_voices();
-                        self.refresh_models();
                     }
                 }
                 ui.checkbox(&mut self.show_details, "显示思考/工具");
@@ -846,56 +838,42 @@ impl App {
     }
 
     /// Model choice for backends that take one at launch.
+    /// Model / reasoning-effort dropdowns, straight from what the agent advertised
+    /// over ACP. One combo per option, so dsh shows both a model and a reasoning
+    /// effort while kiro shows only a model — the panel does not decide, the
+    /// backend does. Changing a value applies over ACP with no restart.
     fn model_picker(&mut self, ui: &mut egui::Ui) {
-        ui.heading("模型");
-        if !models::selectable(&self.agent_id) {
-            ui.weak(models::unsupported_note(&self.agent_id));
+        if self.config_options.is_empty() {
+            ui.heading("模型");
+            ui.weak("当前后端没有自报可选模型（或还没连上）");
             return;
         }
-        if self.model_list.is_empty() {
-            ui.weak("拿不到模型列表（CLI 没响应或未登录）");
-            if ui.button("重试").clicked() {
-                self.refresh_models();
-            }
-            return;
-        }
-        let current = if self.model.is_empty() {
-            "后端默认".to_string()
-        } else {
-            self.model.clone()
-        };
-        let mut picked: Option<String> = None;
-        egui::ComboBox::from_id_salt("model")
-            .selected_text(current)
-            .width(260.0)
-            .show_ui(ui, |ui| {
-                if ui.selectable_label(self.model.is_empty(), "后端默认").clicked() {
-                    picked = Some(String::new());
-                }
-                for m in &self.model_list {
-                    let mark = if m.default { " ★" } else { "" };
-                    let label = if m.cost.is_empty() {
-                        format!("{}{mark}", m.id)
-                    } else {
-                        format!("{}{mark}   {}", m.id, m.cost)
-                    };
-                    if ui
-                        .selectable_label(self.model == m.id, label)
-                        .on_hover_text(&m.note)
-                        .clicked()
-                    {
-                        picked = Some(m.id.clone());
+        // Collected first so the borrow of self.config_options ends before send().
+        let mut change: Option<(String, String)> = None;
+        for opt in &self.config_options {
+            ui.heading(&opt.label);
+            let current = opt.current_label().to_string();
+            egui::ComboBox::from_id_salt(format!("cfg_{}", opt.id))
+                .selected_text(current)
+                .width(300.0)
+                .show_ui(ui, |ui| {
+                    for c in &opt.choices {
+                        let selected = c.value == opt.current;
+                        let mut item = ui.selectable_label(selected, &c.label);
+                        if !c.note.is_empty() {
+                            item = item.on_hover_text(&c.note);
+                        }
+                        if item.clicked() {
+                            change = Some((opt.id.clone(), c.value.clone()));
+                        }
                     }
-                }
-            });
-        if let Some(id) = picked {
-            self.model = id.clone();
-            // A model is a launch flag, so this relaunches the agent. Same backend,
-            // so the session is reloaded and the conversation carries over.
-            self.phase = Phase::Restarting;
-            self.send(UiCommand::Tune(Tunable::Model(id)));
+                });
         }
-        ui.weak("改模型会重启 agent（同一后端，会话会接回来）。★ 是后端默认。");
+        if let Some((option_id, value)) = change {
+            // Applied on the live connection; no restart, conversation intact.
+            self.send(UiCommand::SetConfig { option_id, value });
+        }
+        ui.weak("改动通过 ACP 即时生效，不重启 agent，也不打断当前会话。");
     }
 
     /// Spoken replies.

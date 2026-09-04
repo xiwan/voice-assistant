@@ -47,9 +47,6 @@ pub struct Settings {
     pub agent_cmd: String,
     /// kiro-cli agent permission mode: readonly / safe / full.
     pub agent_mode: String,
-    /// Model id passed to the agent at launch, for backends that take one
-    /// (`kiro-cli acp --model <id>`). Empty = the backend's own default.
-    pub model: String,
     /// End the utterance after this much trailing silence.
     pub silence_ms: u32,
     /// Give up (back to wake word) if no speech starts within this window.
@@ -80,7 +77,6 @@ impl Default for Settings {
             threshold: 0.5,
             agent_cmd: "kiro-cli acp --agent voice".into(),
             agent_mode: "readonly".into(),
-            model: String::new(),
             silence_ms: 1000,
             no_speech_ms: 6000,
             max_utterance_ms: 30000,
@@ -288,7 +284,6 @@ pub fn load() -> Option<Settings> {
             "threshold" => s.threshold = v.parse().unwrap_or(0.5),
             "agent_cmd" => s.agent_cmd = v.into(),
             "agent_mode" => s.agent_mode = v.into(),
-            "model" => s.model = v.into(),
             "silence_ms" => s.silence_ms = v.parse().unwrap_or(1000),
             "no_speech_ms" => s.no_speech_ms = v.parse().unwrap_or(6000),
             "max_utterance_ms" => s.max_utterance_ms = v.parse().unwrap_or(30000),
@@ -310,7 +305,7 @@ pub fn save(s: &Settings) -> Result<()> {
         config_path(),
         format!(
             "wake_word={}\nlang={}\nwhisper={}\nthreshold={}\nagent_cmd={}\n\
-             agent_mode={}\nmodel={}\nsilence_ms={}\nno_speech_ms={}\nmax_utterance_ms={}\n\
+             agent_mode={}\nsilence_ms={}\nno_speech_ms={}\nmax_utterance_ms={}\n\
              tts={}\ntts_voice={}\ntts_rate={}\ntts_cmd={}\n\
              listen_mode={}\nptt_key={}\n",
             s.wake_word,
@@ -319,7 +314,6 @@ pub fn save(s: &Settings) -> Result<()> {
             s.threshold,
             s.agent_cmd,
             s.agent_mode,
-            s.model,
             s.silence_ms,
             s.no_speech_ms,
             s.max_utterance_ms,
@@ -514,9 +508,6 @@ pub fn interactive_setup(existing: Option<Settings>) -> Result<Settings> {
         threshold,
         agent_cmd,
         agent_mode,
-        // Not asked here: the model is a panel choice, and setup must not silently
-        // reset one the user picked there.
-        model: cur.model.clone(),
         silence_ms,
         no_speech_ms,
         max_utterance_ms,

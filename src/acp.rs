@@ -20,6 +20,7 @@
 //! spends time thinking or in tools never looks like a hang. Agent-specific
 //! notifications (kiro's `_kiro.dev/*`) are ignored.
 
+use crate::config_option::{self, ConfigOption, SetVia};
 use crate::session::{Plan, Recovery, Role, Store};
 use crate::tts::{SpeechBuffer, Tts};
 use crate::ui::{ToolState, Ui};
@@ -81,6 +82,9 @@ pub struct AcpConnection {
     /// *same* backend is coming back; switching to a different agent can never
     /// reuse this session id, so waiting would be pure latency.
     graceful: bool,
+    /// Model / reasoning-effort options the agent advertised at `session/new`.
+    /// Data-driven: whatever the backend reports, the front end can offer.
+    config_options: Vec<ConfigOption>,
 }
 
 impl AcpConnection {
@@ -134,6 +138,7 @@ impl AcpConnection {
             replaying: false,
             pending_recap: None,
             graceful: true,
+            config_options: Vec::new(),
         };
         // A backend that dies on startup usually explains itself on stderr, but
         // the explanation can land a moment after the pipe closes — hence the
@@ -150,6 +155,12 @@ impl AcpConnection {
             }
         };
         Ok((c, incoming, recovered))
+    }
+
+    /// Tell the front end what the agent offers. Called after a connection is set
+    /// up and after any change, so the panel always mirrors the live state.
+    pub fn report_config_options(&self) {
+        self.ui.config_options(self.config_options.clone());
     }
 
     /// `false` = drop without waiting for a clean exit. Set before replacing this
@@ -194,8 +205,9 @@ impl AcpConnection {
         if let Plan::Load(id) = &plan {
             self.ui.progress("正在接回上次的会话…");
             match self.load_session(incoming, id, &cwd) {
-                Ok(()) => {
+                Ok(loaded) => {
                     self.session_id = id.clone();
+                    self.config_options = config_option::parse(&loaded);
                     return Ok(Recovery::Restored);
                 }
                 Err(e) => {
@@ -218,6 +230,8 @@ impl AcpConnection {
             .and_then(Value::as_str)
             .context("session/new returned no sessionId")?
             .to_string();
+        // Whatever model / reasoning-effort choices the agent advertised.
+        self.config_options = config_option::parse(&newsess);
         {
             let mut store = self.store.lock().expect("session store poisoned");
             store.bind(argv, &self.session_id);
@@ -244,7 +258,7 @@ impl AcpConnection {
         incoming: &Receiver<Incoming>,
         id: &str,
         cwd: &str,
-    ) -> Result<()> {
+    ) -> Result<Value> {
         self.replaying = true;
         let result = self.request_blocking(
             incoming,
@@ -252,7 +266,7 @@ impl AcpConnection {
             json!({ "sessionId": id, "cwd": cwd, "mcpServers": [] }),
         );
         self.replaying = false;
-        result.map(|_| ())
+        result
     }
 
     /// Send a request and block until its response arrives, handling
@@ -323,6 +337,49 @@ impl AcpConnection {
 
     pub fn is_busy(&self) -> bool {
         self.active_prompt.is_some()
+    }
+
+
+    /// Apply a choice the front end made, over ACP, without restarting the agent.
+    /// Routes to whichever method the option came from (verified: kiro uses
+    /// `session/set_model`, dsh uses `session/set_config_option`). Re-parses the
+    /// returned state so `current` reflects what actually took effect.
+    pub fn set_config(
+        &mut self,
+        incoming: &Receiver<Incoming>,
+        option_id: &str,
+        value: &str,
+    ) -> Result<()> {
+        let via = self
+            .config_options
+            .iter()
+            .find(|o| o.id == option_id)
+            .map(|o| o.set_via())
+            .ok_or_else(|| anyhow!("unknown config option: {option_id}"))?;
+        let session_id = self.session_id.clone();
+        let (method, params) = match via {
+            SetVia::Model => (
+                "session/set_model",
+                json!({ "sessionId": session_id, "modelId": value }),
+            ),
+            SetVia::ConfigOption => (
+                "session/set_config_option",
+                // dsh names the fields `configId` and `value`, and returns the
+                // full `{ configOptions }` set (verified against its acp profile).
+                json!({ "sessionId": session_id, "configId": option_id, "value": value }),
+            ),
+        };
+        let result = self.request_blocking(incoming, method, params)?;
+        // Both backends return the resulting state; dsh returns the full option
+        // set, kiro returns nothing useful, so fall back to patching `current`.
+        let reparsed = config_option::parse(&result);
+        if !reparsed.is_empty() {
+            self.config_options = reparsed;
+        } else if let Some(opt) = self.config_options.iter_mut().find(|o| o.id == option_id) {
+            opt.current = value.to_string();
+        }
+        self.report_config_options();
+        Ok(())
     }
 
     /// Cancel the running turn and pump messages until it actually resolves,

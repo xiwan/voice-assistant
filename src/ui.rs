@@ -88,6 +88,10 @@ pub enum UiEvent {
     /// seconds (measured 4.3s for kiro-cli), and without this the window shows
     /// nothing at all between the click and the connection.
     AgentProgress(String),
+    /// The model / reasoning-effort options the connected agent advertised. Sent
+    /// on every connect and after every change, so the panel is a mirror of what
+    /// the backend actually offers rather than a hardcoded list.
+    ConfigOptions(Vec<crate::config_option::ConfigOption>),
     /// How much of the conversation survived opening a connection. Emitted on
     /// every connect, including the first (`Fresh`), so a front end never has to
     /// guess whether the assistant still remembers what was said.
@@ -129,6 +133,9 @@ pub enum UiCommand {
     /// Anything requiring a model reload (wake word, whisper size, language) is
     /// deliberately not here — those are written to config and need a restart.
     Tune(Tunable),
+    /// Pick a value for an option the agent advertised (a model, a reasoning-effort
+    /// level). Applied over ACP without restarting the agent.
+    SetConfig { option_id: String, value: String },
     /// Replace the agent's system prompt (the identity in voice.json). The
     /// pipeline persists it, rewrites the managed agent file, and reconnects
     /// so the running agent picks it up — same path as a permission change.
@@ -165,10 +172,6 @@ pub enum Tunable {
     /// call immediately; the agent is relaunched because the flag is on its
     /// command line and its allow-list file has to be rewritten.
     AgentMode(String),
-    /// Model the agent runs, for backends that take one at launch. Applied by
-    /// relaunching that same backend, so the session is reloaded and the
-    /// conversation continues across the change.
-    Model(String),
     /// Spoken replies: engine id ("off" / "say" / "cmd" / "sapi" / "espeak").
     /// Applied by swapping the player's engine, so it needs no restart.
     TtsEngine(String),
@@ -256,6 +259,9 @@ impl Ui {
     }
     pub fn progress<S: Into<String>>(&self, what: S) {
         self.emit(UiEvent::AgentProgress(what.into()));
+    }
+    pub fn config_options(&self, opts: Vec<crate::config_option::ConfigOption>) {
+        self.emit(UiEvent::ConfigOptions(opts));
     }
     pub fn context(&self, how: crate::session::Recovery) {
         self.emit(UiEvent::Context(how));
@@ -358,6 +364,13 @@ impl Term {
             // Diagnostics keep going to stderr, as before.
             UiEvent::AgentRestarting(why) => eprintln!(">> agent 重启中: {why}"),
             UiEvent::AgentProgress(what) => eprintln!(">> {what}"),
+            // A compact one-liner per advertised option; the window has the full
+            // dropdowns, the terminal just states what is in effect.
+            UiEvent::ConfigOptions(opts) => {
+                for o in opts {
+                    eprintln!(">> {}: {}", o.label, o.current_label());
+                }
+            }
             UiEvent::Error(msg) => eprintln!(">> {msg}"),
         }
     }
