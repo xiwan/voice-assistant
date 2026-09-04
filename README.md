@@ -1,5 +1,7 @@
 # voice-assistant
 
+![voice-assistant](screenshot.png)
+
 macOS / Windows / Linux 上的本地语音助手：说出唤醒词，语音指令自动转文字并交给
 [kiro-cli](https://kiro.dev) 执行。纯 Rust 单二进制，推理全部本地运行，无云端依赖。
 
@@ -89,11 +91,12 @@ voice-assistant gui
 - 对话流：你说的话、流式生成的回答；思考过程和工具调用默认折叠，勾选后展开
 - 暂停 / 继续 / 放弃三个按钮，和说"暂停/继续/算了"完全等价
 - 输入框：不方便说话时直接打字
-- ⚙ 设置面板：按功能分成六个页签 —— **Agent**（切后端 / 选模型 / 权限档）、**语音**
+- ⚙ 设置面板：按功能分成六个页签 —— **Agent**（切后端 / 选模型 / 推理档 / 权限档）、**语音**
   （引擎 / 音色 / 语速 / sidecar，带"试听"，改完即时生效）、**听**（常听或按住说话 / 断句参数）、
-  **身份**（提示词）、**凭据**（模型 API key）、**重启项**。模型列表来自后端自己
-  （`kiro-cli chat --list-models`，带倍率，★ 是默认）；换模型会重启 agent，但同一后端会
-  `session/load` 把会话接回来。`dsh` 没有 `--model`，面板会直说而不是给个假控件。
+  **身份**（提示词）、**凭据**（模型 API key）、**重启项**。模型与推理档由**后端自己在 ACP
+  连接时上报**（kiro 报 `models`、dsh 报 `configOptions` 含 reasoning_effort），面板照报的画：
+  改选项通过 ACP（`session/set_model` / `session/set_config_option`）即时生效，**不重启 agent、
+  不打断会话**。后端没报可选项（如自定义命令）就不显示，不给假控件。
   每个 agent 前面有个手绘小标记（kiro 是幽灵、dsh 是鲸鱼、Claude 是放射线、Codex 是六边形）——
   不是厂商官方 logo：egui 自带字体没有这些 emoji 字形，而打包商标素材要引入图片解码器
 
@@ -185,7 +188,6 @@ agent 进程被 SIGKILL 掉时，会话锁会留在原地且永不过期，那�
 | `whisper` | `VA_WHISPER_MODEL`* | base | whisper 模型：base / small / medium |
 | `threshold` | `VA_WAKE_THRESHOLD` | 0.5 | 唤醒词检测阈值 |
 | `agent_mode` | — | readonly | kiro 权限：readonly / safe / full |
-| `model` | `VA_MODEL` | 空 | 启动时传给后端的模型 id（仅支持 `--model` 的后端，如 kiro-cli）；空 = 后端默认 |
 | `agent_cmd` | `VA_AGENT_CMD` | kiro-cli acp --agent voice | ACP agent 启动命令（换后端只改这里） |
 | `tts` | `VA_TTS` | 按平台 | 语音回复引擎：say（macOS）/ sapi（Windows）/ espeak（Linux）/ cmd / off |
 | `tts_voice` | `VA_TTS_VOICE` | 自动 | 音色，留空则按语言选（zh → Tingting / cmn） |
